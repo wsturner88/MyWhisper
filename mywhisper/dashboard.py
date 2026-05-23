@@ -1158,7 +1158,7 @@ function savePresetEdit() {{
 
 // --- Model dropdown -----------------------------------------------------
 
-let _modelList = [];      // last-fetched [{id, label}]
+let _modelList = [];      // last-fetched list of id/label objects
 let _lastProvider = '';   // refetch when this changes
 
 function syncModelDropdown(currentId) {{
