@@ -435,19 +435,42 @@ class MyWhisperApp(rumps.App):
                     self._events.put(("notify", "Speaker separation skipped", ""))
 
             transcript_md = output.format_transcript(segments, diarized)
+            provider_name = config.LLM_PROVIDERS[config.get_llm_provider()]["label"]
+            model_name = config.get_llm_model(config.get_llm_provider()) or "(not set)"
+            summary_failed = False
             try:
-                log.info("meeting: summarizing via LLM")
+                log.info("meeting: summarizing via LLM (provider=%s, model=%s)",
+                         provider_name, model_name)
                 summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
                 )
+                if not summary_md or not summary_md.strip():
+                    raise RuntimeError("Empty summary returned by LLM.")
             except Exception as e:
                 log.exception("meeting: summary failed")
-                summary_md = f"_Summary failed ({e})._"
+                summary_failed = True
+                summary_md = (
+                    "## ⚠️ Summary Failed\n\n"
+                    f"The LLM did not produce a summary.\n\n"
+                    f"- **Provider:** {provider_name}\n"
+                    f"- **Model:** `{model_name}`\n"
+                    f"- **Error:** {e}\n\n"
+                    "**What to do:** Open MyWhisper → Dashboard → "
+                    "Settings → LLM and try a different model, or hit "
+                    "Test Connection to diagnose. Your full transcript is "
+                    "below — once the LLM works, you can paste it into "
+                    "ChatGPT/Claude manually for a one-time summary, or "
+                    "re-run with a working setup."
+                )
 
             path = output.save_meeting(config.app_dir(), transcript_md, summary_md)
             log.info("meeting: saved %s", path)
-            self._events.put(("notify", "Meeting notes ready", path.name))
+            if summary_failed:
+                self._events.put(("notify", "Meeting saved (summary failed)",
+                                  "Check the file for details."))
+            else:
+                self._events.put(("notify", "Meeting notes ready", path.name))
         except Exception:
             log.exception("meeting: failed")
             self._events.put(("notify", "Meeting failed",
