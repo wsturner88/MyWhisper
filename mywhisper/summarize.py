@@ -1,7 +1,7 @@
 import logging
 import time
 
-from . import config, llm
+from . import calendar_lookup, config, llm
 
 log = logging.getLogger("mywhisper")
 
@@ -41,17 +41,21 @@ def _call_llm(cfg, system, user, max_tokens, label=""):
     )
 
 
-def summarize_transcript(cfg, transcript_text, preset_id=None):
+def summarize_transcript(cfg, transcript_text, preset_id=None,
+                         calendar_event=None):
     """Chunked summarization, with prompts shaped by the selected preset.
 
-    Returns a (title, summary_md) tuple. Title is a short LLM-generated
-    label (e.g. 'Sales call with Acme — pricing review'). If the title
-    pass fails, returns an empty title and the caller falls back to a
-    timestamp-only filename.
+    `calendar_event` is an optional dict from calendar_lookup; if provided
+    its title/attendees/notes/organizer are fed into the prompts so the
+    summary uses real names instead of 'Speaker 1'.
+
+    Returns (title, summary_md). Calendar title (if any) wins over the
+    LLM-generated one — the caller is responsible for that choice.
     """
     preset_id = preset_id or config.get_meeting_preset()
     preset = config.MEETING_PRESETS.get(preset_id, config.MEETING_PRESETS["general"])
     system = _system_prompt(preset)
+    cal_block = calendar_lookup.context_block(calendar_event)
 
     chunks = _chunks(transcript_text)
     if not chunks:
@@ -64,19 +68,25 @@ def summarize_transcript(cfg, transcript_text, preset_id=None):
         for i, chunk in enumerate(chunks, 1):
             user = (
                 f"This is part {i} of {len(chunks)} of a meeting transcript "
-                f"for a **{preset['label']}**. Pull out {preset['focus']} "
-                f"from this part:\n\n{chunk}"
+                f"for a **{preset['label']}**.\n\n"
+                f"{cal_block}\n"
+                f"Pull out {preset['focus']} from this part. Use the real "
+                f"attendee names from the calendar context above instead of "
+                f"'Speaker 1' / 'Speaker 2' where you can tell who spoke.\n\n"
+                f"Transcript part:\n{chunk}"
             )
             notes.append(_call_llm(cfg, system, user, max_tokens=1024,
                                    label=f"chunk {i}/{len(chunks)}"))
 
     combined = "\n\n".join(notes)
     final = (
-        f"Below are notes from a **{preset['label']}**. Produce final meeting "
-        f"notes in Markdown with exactly these sections:\n\n"
+        f"Below are notes from a **{preset['label']}**.\n\n"
+        f"{cal_block}\n"
+        f"Produce final meeting notes in Markdown with exactly these sections:\n\n"
         "## Summary\n## Key Decisions\n## Action Items\n## Open Questions\n\n"
-        "Use bullet points. If a section has nothing, write '- None'. "
-        f"Lean into {preset['focus']}.\n\n"
+        f"Use bullet points. Use real attendee names from the calendar "
+        f"context where possible. If a section has nothing, write "
+        f"'- None'. Lean into {preset['focus']}.\n\n"
         f"{combined}"
     )
     summary = _call_llm(cfg, system, final, max_tokens=2048, label="final pass")

@@ -5,13 +5,14 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import rumps
 
-from . import (audio, autostart, config, dashboard, diarize, dictation_log,
-               hotkeys, meeting_indicator, output, paste, recorder, sounds,
-               summarize, transcribe, vocab, waveform)
+from . import (audio, autostart, calendar_lookup, config, dashboard, diarize,
+               dictation_log, hotkeys, meeting_indicator, output, paste,
+               recorder, sounds, summarize, transcribe, vocab, waveform)
 
 HELPER_NAME = "mywhisper-sysaudio"
 
@@ -133,6 +134,19 @@ class MyWhisperApp(rumps.App):
         rumps.Timer(self._poll, 0.2).start()
         rumps.Timer(self._tick_waveform, 0.04).start()
         threading.Thread(target=self._prewarm, daemon=True).start()
+
+        # Ask for Calendar access once. If user has never been prompted,
+        # this shows the system dialog. If already decided, this is a
+        # no-op. Either way it's non-blocking — we just log the result.
+        try:
+            if calendar_lookup.authorization_status() == 0:
+                log.info("requesting calendar access")
+                calendar_lookup.request_access()
+            else:
+                log.info("calendar access: %s", calendar_lookup.status_label())
+        except Exception:
+            log.exception("calendar permission request failed")
+
         log.info("app ready (provider=%s, model=%s)",
                  self.cfg["llm"]["provider"], self.cfg["whisper"]["model"])
 
@@ -328,6 +342,8 @@ class MyWhisperApp(rumps.App):
             return  # already recording; ignore (Stop button is what they want)
         preset_id = getattr(sender, "_preset_id", "general")
         self._meeting_preset = preset_id
+        self._meeting_started_at = datetime.now()
+        self._calendar_event = None  # set on stop
         config.set_meeting_preset(preset_id)
         log.info("meeting: start requested (preset=%s)", preset_id)
         self._mic_wav = _tmp_wav()
@@ -437,6 +453,17 @@ class MyWhisperApp(rumps.App):
             transcript_md = output.format_transcript(segments, diarized)
             provider_name = config.LLM_PROVIDERS[config.get_llm_provider()]["label"]
             model_name = config.get_llm_model(config.get_llm_provider()) or "(not set)"
+
+            # Look up a matching calendar event (Outlook, Google, Apple —
+            # whatever's synced to macOS). Soft lookup — None if no match
+            # or no permission.
+            cal_event = None
+            try:
+                start_ts = getattr(self, "_meeting_started_at", None)
+                cal_event = calendar_lookup.find_meeting_near(start_ts)
+            except Exception:
+                log.exception("meeting: calendar lookup failed")
+
             summary_failed = False
             title = ""
             try:
@@ -445,7 +472,11 @@ class MyWhisperApp(rumps.App):
                 title, summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
+                    calendar_event=cal_event,
                 )
+                # Calendar title beats LLM-generated title when present.
+                if cal_event and cal_event.get("title"):
+                    title = cal_event["title"]
                 if not summary_md or not summary_md.strip():
                     raise RuntimeError("Empty summary returned by LLM.")
                 if title:
