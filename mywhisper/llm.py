@@ -115,7 +115,7 @@ def test_connection():
     provider, key, model = _active_provider()
     info = config.LLM_PROVIDERS[provider]
     label = info["label"]
-    if info.get("key_name") and not key:
+    if info.get("key_name") and not info.get("key_optional") and not key:
         return False, f"No API key set for {label}."
     if info.get("needs_url") and not config.get_custom_llm_url():
         return False, f"No server URL set for {label}."
