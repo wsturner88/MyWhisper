@@ -10,8 +10,8 @@ from pathlib import Path
 import rumps
 
 from . import (audio, autostart, config, dashboard, diarize, dictation_log,
-               hotkeys, output, paste, recorder, sounds, summarize,
-               transcribe, vocab, waveform)
+               hotkeys, meeting_indicator, output, paste, recorder, sounds,
+               summarize, transcribe, vocab, waveform)
 
 HELPER_NAME = "mywhisper-sysaudio"
 
@@ -78,6 +78,8 @@ class MyWhisperApp(rumps.App):
         self.mic = recorder.MicRecorder()
         self.sysaudio = recorder.SystemAudioRecorder(_helper_path())
         self.waveform = waveform.Indicator(kind=config.get_visualization())
+        self.meeting_panel = meeting_indicator.MeetingIndicator(
+            on_stop=lambda: self._events.put(("stop_meeting",)))
         self._events = queue.Queue()
         self._mic_wav = None
         self._dictation_started = 0.0
@@ -164,6 +166,8 @@ class MyWhisperApp(rumps.App):
     def _tick_waveform(self, _):
         if self.state == "dictation":
             self.waveform.update(self.mic.level)
+        elif self.state == "meeting":
+            self.meeting_panel.tick()
 
     # -- UI helpers ---------------------------------------------------
     def _notify(self, title, message):
@@ -213,6 +217,8 @@ class MyWhisperApp(rumps.App):
                         self._click_dictation(None)
                     else:
                         self._toggle_meeting()
+                elif kind == "stop_meeting":
+                    self._click_stop_meeting(None)
                 elif kind == "notify":
                     self._notify(event[1], event[2])
                 elif kind == "paste":
@@ -313,6 +319,7 @@ class MyWhisperApp(rumps.App):
             return
         self.state = "meeting"
         self._sync()
+        self.meeting_panel.show()
         if not self.sysaudio.start(_tmp_wav()):
             log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
             self._notify("System audio unavailable",
@@ -323,6 +330,7 @@ class MyWhisperApp(rumps.App):
         if self.state != "meeting":
             return
         log.info("meeting: stop requested")
+        self.meeting_panel.hide()
         self.state = "processing"
         self._sync()
         threading.Thread(target=self._finish_meeting, daemon=True).start()
