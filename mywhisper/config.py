@@ -191,7 +191,11 @@ LLM_PROVIDERS = {
     },
     "custom": {
         "label": "Custom LLM (Local / Self-Hosted)",
-        "key_name": None,
+        # Optional — most local servers don't need a key, but if the
+        # server is behind a reverse proxy or uses Bearer auth, set one
+        # here. It's sent as `Authorization: Bearer <token>` if present.
+        "key_name": "custom_llm_api_key",
+        "key_optional": True,
         "default_model": "",
         "needs_url": True,
     },

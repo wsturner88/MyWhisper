@@ -19,7 +19,8 @@ def _active_provider():
 def chat(cfg, system, user, max_tokens=2048):
     provider, key, model = _active_provider()
     info = config.LLM_PROVIDERS[provider]
-    if info.get("key_name") and not key:
+    # Only require the key if it's *not* marked optional.
+    if info.get("key_name") and not info.get("key_optional") and not key:
         raise LLMError(
             f"No API key set for {info['label']}. "
             f"Set it in MyWhisper → Dashboard → Settings → LLM."
@@ -39,7 +40,7 @@ def chat(cfg, system, user, max_tokens=2048):
                 "No model selected. Pick one from the dropdown after the "
                 "server connects."
             )
-        return _custom_chat(url, model, system, user, max_tokens)
+        return _custom_chat(url, model, system, user, max_tokens, auth_token=key)
     raise LLMError(f"Unknown LLM provider: {provider!r}")
 
 
@@ -63,7 +64,7 @@ def list_models():
             raise LLMError(
                 "Set the Custom LLM URL above first (e.g. http://llm.local:11434)."
             )
-        return _custom_models(url)
+        return _custom_models(url, auth_token=key)
     raise LLMError(f"Unknown LLM provider: {provider!r}")
 
 
@@ -106,15 +107,18 @@ def _anthropic_models(key):
 
 
 def test_connection():
-    """Send a tiny request to verify the API key and model work.
+    """Send a tiny request to verify the connection works.
 
     Returns (True, provider_label) on success or (False, error_message) on
     failure.
     """
     provider, key, model = _active_provider()
-    label = config.LLM_PROVIDERS[provider]["label"]
-    if not key:
+    info = config.LLM_PROVIDERS[provider]
+    label = info["label"]
+    if info.get("key_name") and not key:
         return False, f"No API key set for {label}."
+    if info.get("needs_url") and not config.get_custom_llm_url():
+        return False, f"No server URL set for {label}."
     try:
         reply = chat(
             {},  # cfg not used by chat() anymore
@@ -182,14 +186,19 @@ def _custom_base(url):
     return u
 
 
-def _detect_custom_api(base):
+def _auth_headers(auth_token):
+    return {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+
+
+def _detect_custom_api(base, auth_token=None):
     """Probe the server and figure out whether it speaks Ollama or
     OpenAI-compatible. Returns 'ollama' or 'openai'. Cached per base URL."""
     if base in _custom_api_cache:
         return _custom_api_cache[base]
+    headers = _auth_headers(auth_token)
     # Ollama: /api/tags returns {"models": [...]}
     try:
-        r = requests.get(f"{base}/api/tags", timeout=4)
+        r = requests.get(f"{base}/api/tags", headers=headers, timeout=4)
         if r.ok and "models" in r.json():
             _custom_api_cache[base] = "ollama"
             return "ollama"
@@ -197,7 +206,7 @@ def _detect_custom_api(base):
         pass
     # OpenAI-compatible: /v1/models returns {"data": [...]}
     try:
-        r = requests.get(f"{base}/v1/models", timeout=4)
+        r = requests.get(f"{base}/v1/models", headers=headers, timeout=4)
         if r.ok and "data" in r.json():
             _custom_api_cache[base] = "openai"
             return "openai"
@@ -210,11 +219,12 @@ def _detect_custom_api(base):
     )
 
 
-def _custom_models(url):
+def _custom_models(url, auth_token=None):
     base = _custom_base(url)
-    style = _detect_custom_api(base)
+    style = _detect_custom_api(base, auth_token=auth_token)
+    headers = _auth_headers(auth_token)
     if style == "ollama":
-        r = requests.get(f"{base}/api/tags", timeout=8)
+        r = requests.get(f"{base}/api/tags", headers=headers, timeout=8)
         r.raise_for_status()
         data = r.json().get("models", []) or []
         models = []
@@ -228,7 +238,7 @@ def _custom_models(url):
         models.sort(key=lambda m: m["label"].lower())
         return models
     # openai-compatible
-    r = requests.get(f"{base}/v1/models", timeout=8)
+    r = requests.get(f"{base}/v1/models", headers=headers, timeout=8)
     r.raise_for_status()
     data = r.json().get("data", []) or []
     models = []
@@ -241,12 +251,14 @@ def _custom_models(url):
     return models
 
 
-def _custom_chat(url, model, system, user, max_tokens):
+def _custom_chat(url, model, system, user, max_tokens, auth_token=None):
     base = _custom_base(url)
-    style = _detect_custom_api(base)
+    style = _detect_custom_api(base, auth_token=auth_token)
+    headers = _auth_headers(auth_token)
     if style == "ollama":
         r = requests.post(
             f"{base}/api/chat",
+            headers=headers,
             json={
                 "model": model,
                 "messages": [
@@ -263,6 +275,7 @@ def _custom_chat(url, model, system, user, max_tokens):
     # openai-compatible
     r = requests.post(
         f"{base}/v1/chat/completions",
+        headers=headers,
         json={
             "model": model,
             "messages": [

@@ -101,6 +101,7 @@ def _state_snapshot():
         ],
         "llm_model": config.get_llm_model(provider),
         "llm_needs_key": bool(info.get("key_name")),
+        "llm_key_optional": bool(info.get("key_optional")),
         "llm_needs_url": bool(info.get("needs_url")),
         "custom_llm_url": config.get_custom_llm_url(),
         "api_key_masked": masked,
@@ -855,14 +856,12 @@ def _build_html():
         </div>
 
         <div class="field" id="api-key-row">
-            <label class="field-label">
-                API Key <span id="key-status" class="pill-status"></span>
-            </label>
+            <label class="field-label" id="api-key-label">API Key <span id="key-status" class="pill-status"></span></label>
             <div class="field-row">
                 <input type="password" id="api-key-input" placeholder="Paste your key…">
                 <button class="btn" onclick="saveApiKey()">Save</button>
             </div>
-            <div class="field-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
+            <div class="field-hint" id="api-key-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
         </div>
 
         <div class="field">
@@ -1043,7 +1042,9 @@ function renderState(s) {{
         psel.appendChild(o);
     }});
 
-    // Provider-specific rows: show URL for custom, key for others
+    // Provider-specific rows: URL shows only for providers that use one;
+    // the key row shows whenever the provider has a key_name (required
+    // OR optional).
     $('api-key-row').style.display = s.llm_needs_key ? 'block' : 'none';
     $('custom-url-row').style.display = s.llm_needs_url ? 'block' : 'none';
 
@@ -1060,16 +1061,34 @@ function renderState(s) {{
         }}
     }}
 
-    // API key status pill + masked placeholder
+    // API key field label & status pill
+    const keyLabel = $('api-key-label');
     const pill = $('key-status');
-    if (s.api_key_set) {{
-        pill.className = 'pill-status ok';
-        pill.textContent = 'Set';
-        $('api-key-input').placeholder = s.api_key_masked || 'Saved — paste a new key to replace';
+    const keyHint = $('api-key-hint');
+    if (s.llm_key_optional) {{
+        keyLabel.firstChild.textContent = 'Auth Token (optional) ';
+        keyHint.textContent = 'Most local LLM servers do not need this. Set only if your server requires Bearer authentication.';
+        if (s.api_key_set) {{
+            pill.className = 'pill-status ok';
+            pill.textContent = 'Set';
+            $('api-key-input').placeholder = s.api_key_masked || 'Saved';
+        }} else {{
+            pill.className = '';
+            pill.textContent = '';
+            $('api-key-input').placeholder = 'No auth needed for most servers';
+        }}
     }} else {{
-        pill.className = 'pill-status missing';
-        pill.textContent = 'Not set';
-        $('api-key-input').placeholder = 'Paste your key…';
+        keyLabel.firstChild.textContent = 'API Key ';
+        keyHint.textContent = 'Stored securely in macOS Keychain — never written to disk in plain text.';
+        if (s.api_key_set) {{
+            pill.className = 'pill-status ok';
+            pill.textContent = 'Set';
+            $('api-key-input').placeholder = s.api_key_masked || 'Saved — paste a new key to replace';
+        }} else {{
+            pill.className = 'pill-status missing';
+            pill.textContent = 'Not set';
+            $('api-key-input').placeholder = 'Paste your key…';
+        }}
     }}
 
     // Model dropdown is populated asynchronously by refreshModels();
