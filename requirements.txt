@@ -1,0 +1,20 @@
+# Speech-to-text + speaker separation
+mlx-whisper>=0.4.0
+pyannote.audio>=3.1
+
+# Audio capture / processing
+sounddevice>=0.4.7
+soundfile>=0.12.1
+numpy>=1.24
+scipy>=1.11
+
+# Menubar app + global hotkeys
+rumps>=0.4.0
+pynput>=1.7.7
+
+# Secrets (macOS Keychain) + HTTP
+keyring>=24.0
+requests>=2.31
+
+# TOML parsing for Python < 3.11
+tomli>=2.0.1; python_version < "3.11"

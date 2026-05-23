@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+MyWhisper.app/
+helper/mywhisper-sysaudio
+build.log
+.DS_Store
+.claude/

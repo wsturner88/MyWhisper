@@ -1,0 +1,45 @@
+# MyWhisper configuration.
+# The live config is created at ~/MyWhisper/config.toml on first run.
+# This file is just a reference copy.
+
+[hotkeys]
+# Hold this key to dictate (push-to-talk). Release it and the text is typed
+# wherever your cursor is. Options: right_option, right_command,
+# right_control, right_shift, left_option, left_command
+push_to_talk = "right_option"
+
+[whisper]
+# Any MLX Whisper model on Hugging Face.
+# Balanced: large-v3-turbo. Best accuracy: large-v3. Fastest: small.
+model = "mlx-community/whisper-large-v3-turbo"
+
+[diarization]
+# Speaker separation. Needs a Hugging Face token (see README).
+enabled = true
+
+[llm]
+# provider: "openrouter" | "anthropic"
+# Provider, API key, and model are set via the menu bar:
+# MyWhisper → Settings → LLM (Summaries)
+provider = "openrouter"
+
+openrouter_model = "anthropic/claude-sonnet-4-6"
+
+anthropic_model = "claude-sonnet-4-6"
+
+[dictation]
+# Optional LLM cleanup (removes "um"/"uh"). Sends text to your LLM, adding a
+# round-trip — keep false for instant, fully on-device dictation.
+cleanup = false
+
+[output]
+# Keep this OUTSIDE any cloud-synced folder.
+dir = "~/MyWhisper"
+
+[sounds]
+# Audio cue when push-to-talk recording starts and stops. enabled = false
+# to mute. start/stop are macOS sound names from /System/Library/Sounds
+# (e.g. Tink, Pop, Bottle, Glass, Ping, Submarine).
+enabled = true
+start = "Tink"
+stop = "Pop"
