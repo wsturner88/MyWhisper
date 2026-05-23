@@ -181,13 +181,42 @@ LLM_PROVIDERS = {
         "label": "OpenRouter",
         "key_name": "openrouter_api_key",
         "default_model": "anthropic/claude-sonnet-4-6",
+        "needs_url": False,
     },
     "anthropic": {
         "label": "Anthropic (Claude)",
         "key_name": "anthropic_api_key",
         "default_model": "claude-sonnet-4-6",
+        "needs_url": False,
+    },
+    "custom": {
+        "label": "Custom LLM (Local / Self-Hosted)",
+        "key_name": None,
+        "default_model": "",
+        "needs_url": True,
     },
 }
+
+
+def custom_llm_url_path():
+    return app_dir() / "custom_llm_url.txt"
+
+
+def get_custom_llm_url():
+    try:
+        p = custom_llm_url_path()
+        if p.exists():
+            return p.read_text().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def set_custom_llm_url(url):
+    try:
+        custom_llm_url_path().write_text((url or "").strip().rstrip("/"))
+    except OSError:
+        pass
 
 
 BUILTIN_PRESETS = {

@@ -80,7 +80,9 @@ def _state_snapshot():
     """Everything the JS side needs to render the settings form."""
     provider = config.get_llm_provider()
     info = config.LLM_PROVIDERS[provider]
-    api_key = config.get_secret(info["key_name"]) or ""
+    api_key = ""
+    if info.get("key_name"):
+        api_key = config.get_secret(info["key_name"]) or ""
     masked = (api_key[:4] + "•" * 6 + api_key[-4:]) if len(api_key) >= 12 else ""
 
     try:
@@ -92,10 +94,15 @@ def _state_snapshot():
         "data_dir": str(config.app_dir()),
         "llm_provider": provider,
         "llm_providers": [
-            {"id": pid, "label": info["label"]}
+            {"id": pid, "label": info["label"],
+             "needs_key": bool(info.get("key_name")),
+             "needs_url": bool(info.get("needs_url"))}
             for pid, info in config.LLM_PROVIDERS.items()
         ],
         "llm_model": config.get_llm_model(provider),
+        "llm_needs_key": bool(info.get("key_name")),
+        "llm_needs_url": bool(info.get("needs_url")),
+        "custom_llm_url": config.get_custom_llm_url(),
         "api_key_masked": masked,
         "api_key_set": bool(api_key),
         "mic": config.get_selected_mic() or "",
@@ -164,9 +171,19 @@ def _act_set_model(body):
 def _act_set_api_key(body):
     provider = config.get_llm_provider()
     info = config.LLM_PROVIDERS[provider]
+    if not info.get("key_name"):
+        return  # custom provider doesn't use a key
     val = body.get("value", "").strip()
     if val and "•" not in val:
         config.set_secret(info["key_name"], val)
+    _push_state()
+
+
+def _act_set_custom_url(body):
+    config.set_custom_llm_url(body.get("value", ""))
+    # Clear the cached API style so the next model fetch re-probes.
+    from . import llm
+    llm._custom_api_cache.clear()
     _push_state()
 
 
@@ -305,6 +322,7 @@ _ACTIONS = {
     "pick_folder": _act_pick_folder,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
+    "set_custom_url": _act_set_custom_url,
 }
 
 
@@ -825,7 +843,18 @@ def _build_html():
             <select id="provider-select" onchange="send('set_provider', this.value)"></select>
         </div>
 
-        <div class="field">
+        <div class="field" id="custom-url-row" style="display: none;">
+            <label class="field-label">
+                Server URL <span id="url-status" class="pill-status"></span>
+            </label>
+            <div class="field-row">
+                <input type="text" id="custom-url-input" placeholder="e.g. http://llm.local:11434">
+                <button class="btn" onclick="saveCustomUrl()">Save</button>
+            </div>
+            <div class="field-hint">Ollama, LM Studio, llama.cpp server, etc. — MyWhisper auto-detects the API style.</div>
+        </div>
+
+        <div class="field" id="api-key-row">
             <label class="field-label">
                 API Key <span id="key-status" class="pill-status"></span>
             </label>
@@ -963,6 +992,10 @@ function saveApiKey() {{
     $('api-key-input').value = '';
 }}
 
+function saveCustomUrl() {{
+    send('set_custom_url', $('custom-url-input').value.trim());
+}}
+
 function saveModel() {{
     send('set_model', $('model-input').value.trim());
 }}
@@ -1009,6 +1042,23 @@ function renderState(s) {{
         if (p.id === s.llm_provider) o.selected = true;
         psel.appendChild(o);
     }});
+
+    // Provider-specific rows: show URL for custom, key for others
+    $('api-key-row').style.display = s.llm_needs_key ? 'block' : 'none';
+    $('custom-url-row').style.display = s.llm_needs_url ? 'block' : 'none';
+
+    // URL status
+    if (s.llm_needs_url) {{
+        $('custom-url-input').value = s.custom_llm_url || '';
+        const urlPill = $('url-status');
+        if (s.custom_llm_url) {{
+            urlPill.className = 'pill-status ok';
+            urlPill.textContent = 'Set';
+        }} else {{
+            urlPill.className = 'pill-status missing';
+            urlPill.textContent = 'Not set';
+        }}
+    }}
 
     // API key status pill + masked placeholder
     const pill = $('key-status');
