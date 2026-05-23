@@ -90,6 +90,7 @@ def _state_snapshot():
             {"id": pid, "label": p["label"], "description": p["description"]}
             for pid, p in config.MEETING_PRESETS.items()
         ],
+        "custom_preset": config.get_custom_preset(),
     }
 
 
@@ -187,6 +188,12 @@ def _act_set_preset(body):
     _push_state()
 
 
+def _act_save_custom_preset(body):
+    val = body.get("value") or {}
+    config.set_custom_preset(val.get("label", ""), val.get("focus", ""))
+    _push_state()
+
+
 def _act_pick_folder(body):
     panel = NSOpenPanel.openPanel()
     panel.setCanChooseDirectories_(True)
@@ -222,6 +229,7 @@ _ACTIONS = {
     "set_autostart": _act_set_autostart,
     "save_vocab": _act_save_vocab,
     "set_preset": _act_set_preset,
+    "save_custom_preset": _act_save_custom_preset,
     "pick_folder": _act_pick_folder,
 }
 
@@ -651,8 +659,24 @@ def _build_html():
 
     <div class="settings-section">
         <h3>Meeting Type Preset</h3>
-        <div class="section-desc">Tailors the LLM prompt so summaries focus on what matters for this kind of meeting.</div>
+        <div class="section-desc">You'll be asked which to use each time you start a meeting — the selection here is just the default.</div>
         <div id="preset-list"></div>
+
+        <div id="custom-editor" style="display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid #333;">
+            <div class="field">
+                <label class="field-label">Custom Preset Name</label>
+                <input type="text" id="custom-label" placeholder="e.g. Board Meeting, Vendor Call">
+            </div>
+            <div class="field">
+                <label class="field-label">What should the AI focus on?</label>
+                <textarea id="custom-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
+                <div class="field-hint">Plain English — describe what matters most. The AI will lean into this when writing the summary.</div>
+            </div>
+            <div class="field-row">
+                <button class="btn" onclick="saveCustomPreset()">Save Custom Preset</button>
+                <span id="custom-status" class="field-hint"></span>
+            </div>
+        </div>
     </div>
 
     <div class="settings-section">
@@ -832,6 +856,22 @@ function renderState(s) {{
         card.onclick = () => send('set_preset', p.id);
         list.appendChild(card);
     }});
+
+    // Custom preset editor: show only when 'custom' is the selected default
+    const cust = s.custom_preset || {{}};
+    $('custom-label').value = cust.label || '';
+    $('custom-focus').value = cust.focus || '';
+    $('custom-editor').style.display =
+        (s.meeting_preset === 'custom') ? 'block' : 'none';
+}}
+
+function saveCustomPreset() {{
+    const label = $('custom-label').value;
+    const focus = $('custom-focus').value;
+    send('save_custom_preset', {{ label: label, focus: focus }});
+    const s = $('custom-status');
+    s.textContent = 'Saved.';
+    setTimeout(() => s.textContent = '', 2000);
 }}
 
 renderState(initialState);

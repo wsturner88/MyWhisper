@@ -189,7 +189,7 @@ LLM_PROVIDERS = {
 }
 
 
-MEETING_PRESETS = {
+BUILTIN_PRESETS = {
     "general": {
         "label": "General Meeting",
         "description": "Standard meeting notes — summary, decisions, action items.",
@@ -215,34 +215,85 @@ MEETING_PRESETS = {
             "they're working on next, and any blockers needing help"
         ),
     },
-    "client_review": {
-        "label": "Client Review",
-        "description": "Deliverables, feedback, change requests.",
-        "focus": (
-            "what was presented or delivered, the client's feedback "
-            "(positive and critical), specific change requests, and "
-            "follow-up commitments with dates"
-        ),
-    },
-    "one_on_one": {
-        "label": "1:1",
-        "description": "Personal check-in, career topics, follow-ups.",
-        "focus": (
-            "topics discussed, any career or development conversation, "
-            "personal updates, and specific follow-up items for either "
-            "party"
-        ),
-    },
-    "discovery": {
-        "label": "Discovery Call",
-        "description": "Requirements gathering, scope, stakeholders.",
-        "focus": (
-            "the problem being solved, the current process or tools in "
-            "use, key requirements, stakeholders mentioned, timeline, "
-            "and any budget signals"
-        ),
-    },
 }
+
+DEFAULT_CUSTOM_PRESET = {
+    "label": "My Custom Meeting",
+    "description": "Your own prompt — define what the AI should focus on.",
+    "focus": (
+        "the most important points, any decisions or commitments made, "
+        "and any follow-up items"
+    ),
+}
+
+
+def custom_preset_path():
+    return app_dir() / "custom_preset.json"
+
+
+def get_custom_preset():
+    """Return the user-defined preset dict (label, description, focus)."""
+    try:
+        path = custom_preset_path()
+        if path.exists():
+            data = json.loads(path.read_text())
+            return {
+                "label": data.get("label") or DEFAULT_CUSTOM_PRESET["label"],
+                "description": (data.get("description")
+                                or DEFAULT_CUSTOM_PRESET["description"]),
+                "focus": data.get("focus") or DEFAULT_CUSTOM_PRESET["focus"],
+            }
+    except Exception:
+        pass
+    return dict(DEFAULT_CUSTOM_PRESET)
+
+
+def set_custom_preset(label, focus):
+    label = (label or "").strip() or DEFAULT_CUSTOM_PRESET["label"]
+    focus = (focus or "").strip() or DEFAULT_CUSTOM_PRESET["focus"]
+    try:
+        custom_preset_path().write_text(json.dumps({
+            "label": label,
+            "description": "Your custom prompt.",
+            "focus": focus,
+        }, indent=2))
+    except Exception:
+        pass
+
+
+def meeting_presets():
+    """Built-in presets plus the user's custom preset, in order."""
+    presets = dict(BUILTIN_PRESETS)
+    presets["custom"] = get_custom_preset()
+    return presets
+
+
+# Module-level dict-like accessor so existing references like
+# config.MEETING_PRESETS keep working but stay live.
+class _PresetsView:
+    def __getitem__(self, key):
+        return meeting_presets()[key]
+
+    def get(self, key, default=None):
+        return meeting_presets().get(key, default)
+
+    def items(self):
+        return meeting_presets().items()
+
+    def keys(self):
+        return meeting_presets().keys()
+
+    def values(self):
+        return meeting_presets().values()
+
+    def __contains__(self, key):
+        return key in meeting_presets()
+
+    def __iter__(self):
+        return iter(meeting_presets())
+
+
+MEETING_PRESETS = _PresetsView()
 
 
 def _ensure_config_file():

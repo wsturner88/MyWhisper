@@ -253,9 +253,50 @@ class MyWhisperApp(rumps.App):
             self._sync()
             threading.Thread(target=self._finish_dictation, daemon=True).start()
 
+    def _ask_meeting_preset(self):
+        """Show a native picker. Returns preset_id or None if cancelled."""
+        try:
+            from AppKit import (NSAlert, NSPopUpButton, NSMakeRect,
+                                NSAlertFirstButtonReturn)
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Start Meeting")
+            alert.setInformativeText_(
+                "Pick the meeting type — it shapes what the AI focuses on "
+                "in the summary."
+            )
+            alert.addButtonWithTitle_("Start Recording")
+            alert.addButtonWithTitle_("Cancel")
+
+            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(0, 0, 300, 26), False
+            )
+            preset_ids = []
+            for pid, info in config.MEETING_PRESETS.items():
+                popup.addItemWithTitle_(info["label"])
+                preset_ids.append(pid)
+
+            # Pre-select whatever they used last time.
+            current = config.get_meeting_preset()
+            if current in preset_ids:
+                popup.selectItemAtIndex_(preset_ids.index(current))
+
+            alert.setAccessoryView_(popup)
+            response = alert.runModal()
+            if response == NSAlertFirstButtonReturn:
+                return preset_ids[popup.indexOfSelectedItem()]
+        except Exception:
+            log.exception("meeting: preset picker failed")
+        return None
+
     def _click_meeting(self, _):
         if self.state == "idle":
-            log.info("meeting: start requested")
+            preset_id = self._ask_meeting_preset()
+            if preset_id is None:
+                log.info("meeting: start cancelled at preset picker")
+                return
+            self._meeting_preset = preset_id
+            config.set_meeting_preset(preset_id)
+            log.info("meeting: start requested (preset=%s)", preset_id)
             self._mic_wav = _tmp_wav()
             try:
                 self.mic.start(self._mic_wav)
@@ -357,7 +398,10 @@ class MyWhisperApp(rumps.App):
             transcript_md = output.format_transcript(segments, diarized)
             try:
                 log.info("meeting: summarizing via LLM")
-                summary_md = summarize.summarize_transcript(self.cfg, text)
+                summary_md = summarize.summarize_transcript(
+                    self.cfg, text,
+                    preset_id=getattr(self, "_meeting_preset", None),
+                )
             except Exception as e:
                 log.exception("meeting: summary failed")
                 summary_md = f"_Summary failed ({e})._"
