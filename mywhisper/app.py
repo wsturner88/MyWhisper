@@ -96,11 +96,10 @@ class MyWhisperApp(rumps.App):
         # preset starts the meeting with that preset directly.
         self.mi_meet_menu = rumps.MenuItem("Start Meeting")
         self._preset_items = {}
-        for pid, info in config.MEETING_PRESETS.items():
-            item = rumps.MenuItem(info["label"], callback=self._on_pick_preset)
-            item._preset_id = pid
-            self._preset_items[pid] = item
-            self.mi_meet_menu.add(item)
+        self._rebuild_meeting_submenu()
+        # Keep the submenu in sync when the user adds/edits/deletes presets
+        # in the dashboard.
+        dashboard.on_presets_changed(self._rebuild_meeting_submenu)
 
         # Stop button — disabled (greyed out) when nothing is recording.
         self.mi_stop = rumps.MenuItem("Stop Recording", callback=None)
@@ -144,6 +143,27 @@ class MyWhisperApp(rumps.App):
             log.info("prewarm: speech model ready")
         except Exception:
             log.exception("prewarm failed")
+
+    # -- meeting submenu rebuilds when presets change ------------------
+    def _rebuild_meeting_submenu(self):
+        try:
+            # clear() fails before the submenu is attached to a parent; that
+            # happens on the very first build, when there's nothing to clear
+            # anyway, so just swallow the error.
+            try:
+                self.mi_meet_menu.clear()
+            except Exception:
+                pass
+            self._preset_items = {}
+            for pid, info in config.MEETING_PRESETS.items():
+                item = rumps.MenuItem(info["label"], callback=self._on_pick_preset)
+                item._preset_id = pid
+                self._preset_items[pid] = item
+                self.mi_meet_menu.add(item)
+            log.info("meeting submenu rebuilt (%d presets)",
+                     len(self._preset_items))
+        except Exception:
+            log.exception("meeting submenu rebuild failed")
 
     # -- live setting sync from the dashboard -------------------------
     def _refresh_settings_from_disk(self):

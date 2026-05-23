@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import uuid
 from pathlib import Path
 
 try:
@@ -217,54 +218,141 @@ BUILTIN_PRESETS = {
     },
 }
 
-DEFAULT_CUSTOM_PRESET = {
-    "label": "My Custom Meeting",
-    "description": "Your own prompt — define what the AI should focus on.",
-    "focus": (
-        "the most important points, any decisions or commitments made, "
-        "and any follow-up items"
-    ),
-}
+DEFAULT_CUSTOM_FOCUS = (
+    "the most important points, any decisions or commitments made, "
+    "and any follow-up items"
+)
 
 
-def custom_preset_path():
+# Suggested starter presets the user can clone to get going faster.
+STARTER_PRESETS = [
+    {
+        "label": "Board Meeting",
+        "focus": (
+            "motions made and how they were voted, decisions reached, "
+            "action items with owners and deadlines, and any items "
+            "tabled for the next meeting"
+        ),
+    },
+    {
+        "label": "Personal / Family",
+        "focus": (
+            "what was discussed, commitments made by anyone present, "
+            "and any follow-up items or things to remember"
+        ),
+    },
+    {
+        "label": "Doctor / Medical",
+        "focus": (
+            "diagnoses or assessments shared, medications discussed, "
+            "tests or procedures recommended, follow-up appointments, "
+            "and instructions or restrictions to follow"
+        ),
+    },
+]
+
+
+def custom_presets_path():
+    return app_dir() / "custom_presets.json"
+
+
+def _legacy_single_custom_path():
+    """Pre-multi era — one custom preset file."""
     return app_dir() / "custom_preset.json"
 
 
-def get_custom_preset():
-    """Return the user-defined preset dict (label, description, focus)."""
-    try:
-        path = custom_preset_path()
-        if path.exists():
-            data = json.loads(path.read_text())
-            return {
-                "label": data.get("label") or DEFAULT_CUSTOM_PRESET["label"],
-                "description": (data.get("description")
-                                or DEFAULT_CUSTOM_PRESET["description"]),
-                "focus": data.get("focus") or DEFAULT_CUSTOM_PRESET["focus"],
-            }
-    except Exception:
-        pass
-    return dict(DEFAULT_CUSTOM_PRESET)
+def _new_preset_id():
+    return "c_" + uuid.uuid4().hex[:8]
 
 
-def set_custom_preset(label, focus):
-    label = (label or "").strip() or DEFAULT_CUSTOM_PRESET["label"]
-    focus = (focus or "").strip() or DEFAULT_CUSTOM_PRESET["focus"]
+def _migrate_legacy_custom():
+    """If the user has a single custom preset from before, fold it into
+    the new list once. Safe to call repeatedly — no-op after migration."""
+    new_path = custom_presets_path()
+    if new_path.exists():
+        return
+    legacy = _legacy_single_custom_path()
     try:
-        custom_preset_path().write_text(json.dumps({
-            "label": label,
-            "description": "Your custom prompt.",
-            "focus": focus,
-        }, indent=2))
+        if legacy.exists():
+            data = json.loads(legacy.read_text())
+            label = (data.get("label") or "").strip() or "My Custom Meeting"
+            focus = (data.get("focus") or "").strip() or DEFAULT_CUSTOM_FOCUS
+            entries = [{"id": _new_preset_id(), "label": label, "focus": focus}]
+            new_path.write_text(json.dumps(entries, indent=2))
+            return
     except Exception:
         pass
+    # No legacy file — start with an empty list.
+    try:
+        new_path.write_text("[]")
+    except Exception:
+        pass
+
+
+def get_custom_presets():
+    """Return list of {id, label, focus} dicts."""
+    _migrate_legacy_custom()
+    try:
+        data = json.loads(custom_presets_path().read_text())
+        if isinstance(data, list):
+            cleaned = []
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                cleaned.append({
+                    "id": entry.get("id") or _new_preset_id(),
+                    "label": (entry.get("label") or "").strip() or "Untitled Preset",
+                    "focus": (entry.get("focus") or "").strip() or DEFAULT_CUSTOM_FOCUS,
+                })
+            return cleaned
+    except Exception:
+        pass
+    return []
+
+
+def _save_custom_presets(presets):
+    try:
+        custom_presets_path().write_text(json.dumps(presets, indent=2))
+    except Exception:
+        pass
+
+
+def add_custom_preset(label, focus):
+    presets = get_custom_presets()
+    presets.append({
+        "id": _new_preset_id(),
+        "label": (label or "").strip() or "Untitled Preset",
+        "focus": (focus or "").strip() or DEFAULT_CUSTOM_FOCUS,
+    })
+    _save_custom_presets(presets)
+
+
+def update_custom_preset(preset_id, label, focus):
+    presets = get_custom_presets()
+    for p in presets:
+        if p["id"] == preset_id:
+            p["label"] = (label or "").strip() or "Untitled Preset"
+            p["focus"] = (focus or "").strip() or DEFAULT_CUSTOM_FOCUS
+            break
+    _save_custom_presets(presets)
+
+
+def delete_custom_preset(preset_id):
+    presets = [p for p in get_custom_presets() if p["id"] != preset_id]
+    _save_custom_presets(presets)
 
 
 def meeting_presets():
-    """Built-in presets plus the user's custom preset, in order."""
-    presets = dict(BUILTIN_PRESETS)
-    presets["custom"] = get_custom_preset()
+    """Built-in presets, then the user's custom presets, in order."""
+    presets = {}
+    for pid, info in BUILTIN_PRESETS.items():
+        presets[pid] = info
+    for p in get_custom_presets():
+        presets[p["id"]] = {
+            "label": p["label"],
+            "description": "Custom preset.",
+            "focus": p["focus"],
+        }
     return presets
 
 

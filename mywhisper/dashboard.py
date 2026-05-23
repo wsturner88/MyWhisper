@@ -39,6 +39,24 @@ _bridge = None  # NSObject delegate; keep a reference or PyObjC will GC it
 _PANEL_W = 620
 _PANEL_H = 720
 
+# Callbacks invoked when the user's custom preset list changes — the app
+# registers one so it can rebuild the Start Meeting submenu live.
+_presets_changed_callbacks = []
+
+
+def on_presets_changed(callback):
+    """Register a function to be called whenever custom presets change."""
+    if callback and callback not in _presets_changed_callbacks:
+        _presets_changed_callbacks.append(callback)
+
+
+def _notify_presets_changed():
+    for cb in list(_presets_changed_callbacks):
+        try:
+            cb()
+        except Exception:
+            log.exception("dashboard: presets-changed callback failed")
+
 
 # -- Data gathering for the dashboard ---------------------------------------
 
@@ -86,11 +104,12 @@ def _state_snapshot():
         "autostart": autostart.is_enabled(),
         "vocabulary": _load_vocab_text(),
         "meeting_preset": config.get_meeting_preset(),
-        "meeting_presets": [
+        "builtin_presets": [
             {"id": pid, "label": p["label"], "description": p["description"]}
-            for pid, p in config.MEETING_PRESETS.items()
+            for pid, p in config.BUILTIN_PRESETS.items()
         ],
-        "custom_preset": config.get_custom_preset(),
+        "custom_presets": config.get_custom_presets(),
+        "starter_presets": config.STARTER_PRESETS,
     }
 
 
@@ -189,9 +208,41 @@ def _act_set_preset(body):
 
 
 def _act_save_custom_preset(body):
+    # Legacy single-preset save — converted to update_custom_preset
     val = body.get("value") or {}
-    config.set_custom_preset(val.get("label", ""), val.get("focus", ""))
+    config.add_custom_preset(val.get("label", ""), val.get("focus", ""))
     _push_state()
+
+
+def _act_add_custom_preset(body):
+    val = body.get("value") or {}
+    config.add_custom_preset(val.get("label", ""), val.get("focus", ""))
+    _notify_presets_changed()
+    _push_state()
+
+
+def _act_update_custom_preset(body):
+    val = body.get("value") or {}
+    config.update_custom_preset(
+        val.get("id", ""), val.get("label", ""), val.get("focus", ""))
+    _notify_presets_changed()
+    _push_state()
+
+
+def _act_delete_custom_preset(body):
+    val = body.get("value")
+    preset_id = val.get("id") if isinstance(val, dict) else val
+    config.delete_custom_preset(preset_id or "")
+    _notify_presets_changed()
+    _push_state()
+
+
+def _act_close_panel(body):
+    try:
+        if _panel is not None:
+            _panel.orderOut_(None)
+    except Exception:
+        log.exception("dashboard: close failed")
 
 
 def _act_pick_folder(body):
@@ -230,7 +281,11 @@ _ACTIONS = {
     "save_vocab": _act_save_vocab,
     "set_preset": _act_set_preset,
     "save_custom_preset": _act_save_custom_preset,
+    "add_custom_preset": _act_add_custom_preset,
+    "update_custom_preset": _act_update_custom_preset,
+    "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
+    "close_panel": _act_close_panel,
 }
 
 
@@ -319,6 +374,28 @@ def _build_html():
         padding: 18px 20px 12px;
         border-bottom: 2px solid var(--accent);
         -webkit-app-region: drag;
+        position: relative;
+    }}
+    .close-btn {{
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        width: 26px;
+        height: 26px;
+        border: none;
+        background: rgba(255, 255, 255, 0.10);
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1;
+        border-radius: 13px;
+        cursor: pointer;
+        -webkit-app-region: no-drag;
+        transition: all 0.15s;
+    }}
+    .close-btn:hover {{
+        background: var(--accent);
+        color: white;
     }}
     .header h1 {{ font-size: 18px; font-weight: 600; }}
     .header h1 span {{ color: var(--accent); }}
@@ -556,35 +633,106 @@ def _build_html():
     }}
     #test-result.ok {{ color: var(--green); }}
     #test-result.err {{ color: var(--red); }}
-    .preset-card {{
+    .preset-group-label {{
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        color: var(--text3);
+        margin-bottom: 4px;
+        font-weight: 600;
+    }}
+    .preset-row {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
         background: var(--bg);
         border: 1px solid #444;
         border-radius: 6px;
-        padding: 10px 12px;
-        margin-bottom: 6px;
-        cursor: pointer;
+        padding: 8px 10px;
+        margin-bottom: 4px;
         transition: all 0.15s;
     }}
-    .preset-card:hover {{ border-color: #666; }}
-    .preset-card.selected {{
+    .preset-row:hover {{ border-color: #666; }}
+    .preset-row.selected {{
         border-color: var(--accent);
         background: var(--surface2);
     }}
-    .preset-name {{
-        font-size: 12px;
-        font-weight: 600;
-        color: var(--text);
+    .preset-row .preset-pick {{
+        flex: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
     }}
-    .preset-desc {{
-        font-size: 11px;
+    .preset-row .preset-radio {{
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        border: 1.5px solid #666;
+        flex-shrink: 0;
+        background: transparent;
+    }}
+    .preset-row.selected .preset-radio {{
+        background: var(--accent);
+        border-color: var(--accent);
+        box-shadow: inset 0 0 0 2px var(--bg);
+    }}
+    .preset-row .preset-label {{
+        font-size: 12px;
+        font-weight: 500;
+    }}
+    .preset-row .preset-actions {{
+        display: flex;
+        gap: 4px;
+    }}
+    .preset-row .icon-btn {{
+        background: transparent;
         color: var(--text2);
-        margin-top: 2px;
+        border: 1px solid transparent;
+        padding: 3px 7px;
+        border-radius: 4px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }}
+    .preset-row .icon-btn:hover {{
+        background: var(--surface2);
+        color: var(--text);
+        border-color: #555;
+    }}
+    .preset-row .icon-btn.delete:hover {{
+        color: var(--red);
+        border-color: var(--red);
+    }}
+    .btn-ghost {{
+        background: transparent;
+        border: 1px solid #444;
+    }}
+    .btn-ghost:hover {{
+        background: var(--surface2);
+        border-color: #555;
+    }}
+    .starter-btn {{
+        background: transparent;
+        color: var(--text2);
+        border: 1px dashed #555;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 11px;
+        cursor: pointer;
+        margin: 0 2px;
+        transition: all 0.15s;
+    }}
+    .starter-btn:hover {{
+        border-color: var(--accent);
+        color: var(--text);
     }}
 </style>
 </head>
 <body>
 
 <div class="header">
+    <button class="close-btn" onclick="send('close_panel', null)" title="Close">&#10005;</button>
     <h1>&#127908; <span>MyWhisper</span></h1>
     <div class="updated">Updated {now}</div>
 </div>
@@ -658,23 +806,35 @@ def _build_html():
     </div>
 
     <div class="settings-section">
-        <h3>Meeting Type Preset</h3>
-        <div class="section-desc">You'll be asked which to use each time you start a meeting — the selection here is just the default.</div>
-        <div id="preset-list"></div>
+        <h3>Meeting Type Presets</h3>
+        <div class="section-desc">Pick the default below — you can choose a different one each time from the Start Meeting submenu.</div>
 
-        <div id="custom-editor" style="display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid #333;">
+        <div class="preset-group-label">Built-in</div>
+        <div id="builtin-list"></div>
+
+        <div class="preset-group-label" style="margin-top: 14px;">Your Custom Presets</div>
+        <div id="custom-list"></div>
+
+        <div id="add-row" style="margin-top: 8px;">
+            <button class="btn" onclick="startNewPreset()">+ Add Custom Preset</button>
+            <span class="field-hint" style="margin-left: 10px;">Or use a starter:</span>
+            <span id="starter-buttons"></span>
+        </div>
+
+        <div id="preset-editor" style="display: none; margin-top: 14px; padding: 14px; background: var(--bg); border: 1px solid #444; border-radius: 8px;">
             <div class="field">
-                <label class="field-label">Custom Preset Name</label>
-                <input type="text" id="custom-label" placeholder="e.g. Board Meeting, Vendor Call">
+                <label class="field-label">Preset Name</label>
+                <input type="text" id="editor-label" placeholder="e.g. Board Meeting, Vendor Call">
             </div>
             <div class="field">
                 <label class="field-label">What should the AI focus on?</label>
-                <textarea id="custom-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
+                <textarea id="editor-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
                 <div class="field-hint">Plain English — describe what matters most. The AI will lean into this when writing the summary.</div>
             </div>
             <div class="field-row">
-                <button class="btn" onclick="saveCustomPreset()">Save Custom Preset</button>
-                <span id="custom-status" class="field-hint"></span>
+                <button class="btn" onclick="savePresetEdit()" id="editor-save-btn">Save</button>
+                <button class="btn btn-ghost" onclick="cancelPresetEdit()">Cancel</button>
+                <span id="editor-status" class="field-hint"></span>
             </div>
         </div>
     </div>
@@ -845,33 +1005,113 @@ function renderState(s) {{
     $('autostart-toggle').checked = s.autostart;
     $('vocab-text').value = s.vocabulary;
 
-    // Meeting presets
-    const list = $('preset-list');
-    list.innerHTML = '';
-    s.meeting_presets.forEach(p => {{
-        const card = document.createElement('div');
-        card.className = 'preset-card' + (p.id === s.meeting_preset ? ' selected' : '');
-        card.innerHTML = '<div class="preset-name">' + p.label + '</div>' +
-                         '<div class="preset-desc">' + p.description + '</div>';
-        card.onclick = () => send('set_preset', p.id);
-        list.appendChild(card);
-    }});
+    // Built-in presets — picker only (no edit/delete)
+    const bi = $('builtin-list');
+    bi.innerHTML = '';
+    s.builtin_presets.forEach(p => renderPresetRow(bi, p, s.meeting_preset, false));
 
-    // Custom preset editor: show only when 'custom' is the selected default
-    const cust = s.custom_preset || {{}};
-    $('custom-label').value = cust.label || '';
-    $('custom-focus').value = cust.focus || '';
-    $('custom-editor').style.display =
-        (s.meeting_preset === 'custom') ? 'block' : 'none';
+    // Custom presets — picker + edit + delete
+    const cu = $('custom-list');
+    cu.innerHTML = '';
+    if (!s.custom_presets || s.custom_presets.length === 0) {{
+        const empty = document.createElement('div');
+        empty.className = 'field-hint';
+        empty.style.padding = '8px 0';
+        empty.textContent = 'No custom presets yet. Add one below.';
+        cu.appendChild(empty);
+    }} else {{
+        s.custom_presets.forEach(p => renderPresetRow(cu, p, s.meeting_preset, true));
+    }}
+
+    // Starter quick-add buttons
+    const sb = $('starter-buttons');
+    sb.innerHTML = '';
+    (s.starter_presets || []).forEach(starter => {{
+        const btn = document.createElement('button');
+        btn.className = 'starter-btn';
+        btn.textContent = '+ ' + starter.label;
+        btn.onclick = () => send('add_custom_preset', {{
+            label: starter.label, focus: starter.focus
+        }});
+        sb.appendChild(btn);
+    }});
 }}
 
-function saveCustomPreset() {{
-    const label = $('custom-label').value;
-    const focus = $('custom-focus').value;
-    send('save_custom_preset', {{ label: label, focus: focus }});
-    const s = $('custom-status');
-    s.textContent = 'Saved.';
-    setTimeout(() => s.textContent = '', 2000);
+function renderPresetRow(container, preset, selectedId, editable) {{
+    const row = document.createElement('div');
+    row.className = 'preset-row' + (preset.id === selectedId ? ' selected' : '');
+
+    const pick = document.createElement('div');
+    pick.className = 'preset-pick';
+    pick.innerHTML = '<div class="preset-radio"></div>' +
+                     '<div class="preset-label">' + escapeHtml(preset.label) + '</div>';
+    pick.onclick = () => send('set_preset', preset.id);
+    row.appendChild(pick);
+
+    if (editable) {{
+        const actions = document.createElement('div');
+        actions.className = 'preset-actions';
+        const editBtn = document.createElement('button');
+        editBtn.className = 'icon-btn';
+        editBtn.textContent = 'Edit';
+        editBtn.onclick = (e) => {{ e.stopPropagation(); openEditPreset(preset); }};
+        const delBtn = document.createElement('button');
+        delBtn.className = 'icon-btn delete';
+        delBtn.textContent = 'Delete';
+        delBtn.onclick = (e) => {{
+            e.stopPropagation();
+            if (confirm('Delete preset "' + preset.label + '"?')) {{
+                send('delete_custom_preset', {{ id: preset.id }});
+            }}
+        }};
+        actions.appendChild(editBtn);
+        actions.appendChild(delBtn);
+        row.appendChild(actions);
+    }}
+    container.appendChild(row);
+}}
+
+function escapeHtml(s) {{
+    return String(s || '').replace(/[&<>\"']/g, c => ({{
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }}[c]));
+}}
+
+let _editingId = null;
+
+function startNewPreset() {{
+    _editingId = null;
+    $('editor-label').value = '';
+    $('editor-focus').value = '';
+    $('editor-save-btn').textContent = 'Add Preset';
+    $('preset-editor').style.display = 'block';
+    $('editor-label').focus();
+}}
+
+function openEditPreset(preset) {{
+    _editingId = preset.id;
+    $('editor-label').value = preset.label;
+    $('editor-focus').value = preset.focus;
+    $('editor-save-btn').textContent = 'Save Changes';
+    $('preset-editor').style.display = 'block';
+    $('editor-label').focus();
+}}
+
+function cancelPresetEdit() {{
+    _editingId = null;
+    $('preset-editor').style.display = 'none';
+}}
+
+function savePresetEdit() {{
+    const label = $('editor-label').value;
+    const focus = $('editor-focus').value;
+    if (_editingId) {{
+        send('update_custom_preset', {{ id: _editingId, label: label, focus: focus }});
+    }} else {{
+        send('add_custom_preset', {{ label: label, focus: focus }});
+    }}
+    _editingId = null;
+    $('preset-editor').style.display = 'none';
 }}
 
 renderState(initialState);
@@ -891,7 +1131,6 @@ def _create_panel():
 
     style = (
         NSWindowStyleMaskTitled
-        | NSWindowStyleMaskClosable
         | NSWindowStyleMaskResizable
         | NSWindowStyleMaskUtilityWindow
         | NSWindowStyleMaskFullSizeContentView
@@ -910,6 +1149,12 @@ def _create_panel():
         0.102, 0.102, 0.18, 1.0
     ))
     _panel.setMinSize_(NSMakeSize(480, 480))
+
+    # Hide the traffic-light buttons; we draw our own close button in HTML.
+    for btn_index in (0, 1, 2):   # close, miniaturize, zoom
+        btn = _panel.standardWindowButton_(btn_index)
+        if btn is not None:
+            btn.setHidden_(True)
 
     # Configure WKWebView with a script message handler so JS can call us.
     wk_config = WKWebViewConfiguration.alloc().init()
