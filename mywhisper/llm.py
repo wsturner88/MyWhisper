@@ -109,7 +109,7 @@ def _anthropic_models(key):
 def test_connection():
     """Send a tiny request to verify the connection works.
 
-    Returns (True, provider_label) on success or (False, error_message) on
+    Returns (True, message) on success or (False, error_message) on
     failure.
     """
     provider, key, model = _active_provider()
@@ -119,16 +119,47 @@ def test_connection():
         return False, f"No API key set for {label}."
     if info.get("needs_url") and not config.get_custom_llm_url():
         return False, f"No server URL set for {label}."
+    if not model:
+        return False, "No model selected — pick one from the dropdown."
+
+    # For Custom LLM we already know the URL responds (we just listed
+    # models). Verify the chosen model actually exists on the server.
+    if provider == "custom":
+        try:
+            url = config.get_custom_llm_url()
+            available = _custom_models(url, auth_token=key)
+            ids = {m["id"] for m in available}
+            if model not in ids:
+                return False, (
+                    f"Model '{model}' isn't on the server. Refresh the "
+                    f"model list and pick a different one."
+                )
+        except Exception as e:
+            return False, str(e)
+
+    # Do an actual completion — bigger token budget and a plain prompt so
+    # we get past any "thinking" preamble small models add.
     try:
         reply = chat(
-            {},  # cfg not used by chat() anymore
-            "Reply with exactly: OK",
-            "Say OK",
-            max_tokens=8,
+            {},
+            "You are a helpful assistant. Reply briefly.",
+            "Say the word: hello",
+            max_tokens=128,
         )
-        if reply:
-            return True, label
-        return False, "Got an empty response."
+        if reply.strip():
+            preview = reply.strip()[:60]
+            return True, f"{label} — '{preview}'"
+        # No error, but no text either. The link is good — model probably
+        # warmed up but emitted nothing visible this round.
+        return True, (
+            f"{label} connected. The model returned no text (it may be "
+            f"warming up — try a real meeting and it should work)."
+        )
+    except requests.exceptions.Timeout:
+        return False, (
+            "Timed out. Local models can take 10–30 seconds the very "
+            "first time they're loaded — try Test Connection again."
+        )
     except Exception as e:
         return False, str(e)
 
