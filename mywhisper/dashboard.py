@@ -1275,7 +1275,18 @@ window.onModelsLoaded = function(payload) {{
     if (payload.ok) {{
         _modelList = payload.models || [];
         $('model-status').textContent = _modelList.length + ' available';
-        syncModelDropdown($('model-input').value);
+        const currentModel = $('model-input').value;
+        // If nothing is saved yet, or the saved one isn't in this server's
+        // list, auto-pick the first model so Test Connection just works.
+        const matched = _modelList.some(m => m.id === currentModel);
+        if (_modelList.length > 0 && (!currentModel || !matched)) {{
+            const auto = _modelList[0].id;
+            $('model-input').value = auto;
+            send('set_model', auto);
+            syncModelDropdown(auto);
+        }} else {{
+            syncModelDropdown(currentModel);
+        }}
     }} else {{
         _modelList = [];
         $('model-status').textContent = '⚠ ' + (payload.error || 'load failed');
