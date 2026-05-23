@@ -89,12 +89,25 @@ class MyWhisperApp(rumps.App):
             log.info("restored microphone: %s", saved)
 
         self.mi_dict = rumps.MenuItem("Start Dictation", callback=self._click_dictation)
-        self.mi_meet = rumps.MenuItem("Start Meeting", callback=self._click_meeting)
+
+        # Start Meeting is a submenu — one menu item per preset. Clicking a
+        # preset starts the meeting with that preset directly.
+        self.mi_meet_menu = rumps.MenuItem("Start Meeting")
+        self._preset_items = {}
+        for pid, info in config.MEETING_PRESETS.items():
+            item = rumps.MenuItem(info["label"], callback=self._on_pick_preset)
+            item._preset_id = pid
+            self._preset_items[pid] = item
+            self.mi_meet_menu.add(item)
+
+        # Stop button — disabled (greyed out) when nothing is recording.
+        self.mi_stop = rumps.MenuItem("Stop Recording", callback=None)
         self.mi_status = rumps.MenuItem("Idle", callback=None)
 
         self.menu = [
             self.mi_dict,
-            self.mi_meet,
+            self.mi_meet_menu,
+            self.mi_stop,
             None,
             self.mi_status,
             None,
@@ -160,13 +173,31 @@ class MyWhisperApp(rumps.App):
             pass
 
     def _sync(self):
-        labels = {
-            "idle": ("Start Dictation", "Start Meeting", "Idle"),
-            "dictation": ("Stop Dictation", "Start Meeting", "Recording dictation..."),
-            "meeting": ("Start Dictation", "Stop Meeting", "Recording meeting..."),
-            "processing": ("Working...", "Working...", "Working..."),
-        }
-        self.mi_dict.title, self.mi_meet.title, self.mi_status.title = labels[self.state]
+        """Reflect the current state in the menu bar."""
+        if self.state == "idle":
+            self.mi_dict.title = "Start Dictation"
+            self.mi_meet_menu.title = "Start Meeting"
+            self.mi_stop.title = "Stop Recording"
+            self.mi_stop.set_callback(None)  # greyed out
+            self.mi_status.title = "Idle"
+        elif self.state == "dictation":
+            self.mi_dict.title = "Stop Dictation"
+            self.mi_meet_menu.title = "Start Meeting"
+            self.mi_stop.title = "Stop Recording"
+            self.mi_stop.set_callback(None)
+            self.mi_status.title = "Recording dictation..."
+        elif self.state == "meeting":
+            self.mi_dict.title = "Start Dictation"
+            self.mi_meet_menu.title = "🔴 Meeting in progress"
+            self.mi_stop.title = "■ Stop Meeting"
+            self.mi_stop.set_callback(self._click_stop_meeting)
+            self.mi_status.title = "Recording meeting..."
+        elif self.state == "processing":
+            self.mi_dict.title = "Working..."
+            self.mi_meet_menu.title = "Working..."
+            self.mi_stop.title = "Stop Recording"
+            self.mi_stop.set_callback(None)
+            self.mi_status.title = "Working..."
         self.title = _TITLES[self.state]
 
     # -- event loop (runs on the main thread) -------------------------
@@ -181,7 +212,7 @@ class MyWhisperApp(rumps.App):
                     if event[1] == "dictation":
                         self._click_dictation(None)
                     else:
-                        self._click_meeting(None)
+                        self._toggle_meeting()
                 elif kind == "notify":
                     self._notify(event[1], event[2])
                 elif kind == "paste":
@@ -211,7 +242,7 @@ class MyWhisperApp(rumps.App):
                 if kind == "dictation":
                     self._click_dictation(None)
                 else:
-                    self._click_meeting(None)
+                    self._toggle_meeting()
 
     # -- menu callbacks ----------------------------------------------
     def _open_dashboard(self, _):
@@ -253,68 +284,48 @@ class MyWhisperApp(rumps.App):
             self._sync()
             threading.Thread(target=self._finish_dictation, daemon=True).start()
 
-    def _ask_meeting_preset(self):
-        """Show a native picker. Returns preset_id or None if cancelled."""
-        try:
-            from AppKit import (NSAlert, NSPopUpButton, NSMakeRect,
-                                NSAlertFirstButtonReturn)
-            alert = NSAlert.alloc().init()
-            alert.setMessageText_("Start Meeting")
-            alert.setInformativeText_(
-                "Pick the meeting type — it shapes what the AI focuses on "
-                "in the summary."
-            )
-            alert.addButtonWithTitle_("Start Recording")
-            alert.addButtonWithTitle_("Cancel")
-
-            popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-                NSMakeRect(0, 0, 300, 26), False
-            )
-            preset_ids = []
-            for pid, info in config.MEETING_PRESETS.items():
-                popup.addItemWithTitle_(info["label"])
-                preset_ids.append(pid)
-
-            # Pre-select whatever they used last time.
-            current = config.get_meeting_preset()
-            if current in preset_ids:
-                popup.selectItemAtIndex_(preset_ids.index(current))
-
-            alert.setAccessoryView_(popup)
-            response = alert.runModal()
-            if response == NSAlertFirstButtonReturn:
-                return preset_ids[popup.indexOfSelectedItem()]
-        except Exception:
-            log.exception("meeting: preset picker failed")
-        return None
-
-    def _click_meeting(self, _):
+    def _toggle_meeting(self):
+        """Used by hotkey/trigger files. Starts with last-used preset, or
+        stops if a meeting is already running."""
         if self.state == "idle":
-            preset_id = self._ask_meeting_preset()
-            if preset_id is None:
-                log.info("meeting: start cancelled at preset picker")
-                return
-            self._meeting_preset = preset_id
-            config.set_meeting_preset(preset_id)
-            log.info("meeting: start requested (preset=%s)", preset_id)
-            self._mic_wav = _tmp_wav()
-            try:
-                self.mic.start(self._mic_wav)
-            except Exception:
-                log.exception("meeting: could not start microphone")
-                self._notify("Microphone error", "Could not start recording.")
-                return
-            self.state = "meeting"
-            self._sync()
-            if not self.sysaudio.start(_tmp_wav()):
-                log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
-                self._notify("System audio unavailable",
-                             f"{self.sysaudio.error or ''} Recording microphone only.")
+            class _Fake:
+                pass
+            fake = _Fake()
+            fake._preset_id = config.get_meeting_preset()
+            self._on_pick_preset(fake)
         elif self.state == "meeting":
-            log.info("meeting: stop requested")
-            self.state = "processing"
-            self._sync()
-            threading.Thread(target=self._finish_meeting, daemon=True).start()
+            self._click_stop_meeting(None)
+
+    def _on_pick_preset(self, sender):
+        """Submenu item clicked — start a meeting with the chosen preset."""
+        if self.state != "idle":
+            return  # already recording; ignore (Stop button is what they want)
+        preset_id = getattr(sender, "_preset_id", "general")
+        self._meeting_preset = preset_id
+        config.set_meeting_preset(preset_id)
+        log.info("meeting: start requested (preset=%s)", preset_id)
+        self._mic_wav = _tmp_wav()
+        try:
+            self.mic.start(self._mic_wav)
+        except Exception:
+            log.exception("meeting: could not start microphone")
+            self._notify("Microphone error", "Could not start recording.")
+            return
+        self.state = "meeting"
+        self._sync()
+        if not self.sysaudio.start(_tmp_wav()):
+            log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
+            self._notify("System audio unavailable",
+                         f"{self.sysaudio.error or ''} Recording microphone only.")
+
+    def _click_stop_meeting(self, _):
+        """Stop button clicked while a meeting is recording."""
+        if self.state != "meeting":
+            return
+        log.info("meeting: stop requested")
+        self.state = "processing"
+        self._sync()
+        threading.Thread(target=self._finish_meeting, daemon=True).start()
 
     # -- background workers -------------------------------------------
     def _finish_dictation(self):

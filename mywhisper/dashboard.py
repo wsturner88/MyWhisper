@@ -944,7 +944,11 @@ def open_dashboard():
 
         _load_content()
         _panel.makeKeyAndOrderFront_(None)
-        NSApp.activateIgnoringOtherApps_(True)
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
         log.info("dashboard: opened")
     except Exception:
         log.exception("dashboard: failed to open")
