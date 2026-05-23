@@ -24,7 +24,8 @@ _TITLES = {
     "processing": "⏳ Working",
 }
 
-_LOG_PATH = Path.home() / "MyWhisper" / "mywhisper.log"
+_LOG_PATH = config.log_path()
+_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     filename=str(_LOG_PATH),
     level=logging.INFO,
@@ -91,44 +92,12 @@ class MyWhisperApp(rumps.App):
         self.mi_meet = rumps.MenuItem("Start Meeting", callback=self._click_meeting)
         self.mi_status = rumps.MenuItem("Idle", callback=None)
 
-        self.mic_menu = rumps.MenuItem("Microphone")
-        self._mic_items = {}
-        self._build_mic_menu()
-
-        self.llm_menu = rumps.MenuItem("LLM (Summaries)")
-        self._llm_provider_items = {}
-        self._build_llm_menu()
-
-        self.viz_menu = rumps.MenuItem("Visualization")
-        self._viz_items = {}
-        for label, kind in (("Waveform", "waveform"),
-                            ("VU Meter (Retro)", "vu_meter")):
-            item = rumps.MenuItem(label, callback=self._pick_visualization)
-            self._viz_items[label] = (item, kind)
-            self.viz_menu.add(item)
-        self._update_viz_checks()
-
-        self.mi_autostart = rumps.MenuItem("Start at Login",
-                                           callback=self._toggle_autostart)
-        self.mi_autostart.state = 1 if autostart.is_enabled() else 0
-
-        settings_menu = rumps.MenuItem("Settings")
-        settings_menu.add(self.mic_menu)
-        settings_menu.add(self.viz_menu)
-        settings_menu.add(self.llm_menu)
-        settings_menu.add(rumps.separator)
-        settings_menu.add(rumps.MenuItem("Edit Vocabulary…",
-                                         callback=self._edit_vocab))
-        settings_menu.add(rumps.separator)
-        settings_menu.add(self.mi_autostart)
-
         self.menu = [
             self.mi_dict,
             self.mi_meet,
             None,
             self.mi_status,
             None,
-            settings_menu,
             rumps.MenuItem("Dashboard…", callback=self._open_dashboard),
             rumps.MenuItem("Open Notes Folder", callback=self._open_folder),
             None,
@@ -161,139 +130,23 @@ class MyWhisperApp(rumps.App):
         except Exception:
             log.exception("prewarm failed")
 
-    # -- microphone menu ----------------------------------------------
-    def _build_mic_menu(self):
-        default_item = rumps.MenuItem("System Default", callback=self._on_pick_mic)
-        self._mic_items = {None: default_item}
-        self.mic_menu.add(default_item)
-        for _, name in recorder.input_devices():
-            if name in self._mic_items:
-                continue
-            item = rumps.MenuItem(name, callback=self._on_pick_mic)
-            self._mic_items[name] = item
-            self.mic_menu.add(item)
-        self._update_mic_checks()
-
-    def _update_mic_checks(self):
-        for key, item in self._mic_items.items():
-            item.state = 1 if key == self.mic.device else 0
-
-    def _on_pick_mic(self, sender):
-        name = None if sender.title == "System Default" else sender.title
-        self.mic.device = name
-        config.set_selected_mic(name or "")
-        self._update_mic_checks()
-        log.info("microphone set to: %s", name or "system default")
-
-    def _update_viz_checks(self):
-        for _, (item, kind) in self._viz_items.items():
-            item.state = 1 if kind == self.waveform.kind else 0
-
-    def _pick_visualization(self, sender):
-        _, kind = self._viz_items[sender.title]
-        self.waveform.set_kind(kind)
-        config.set_visualization(kind)
-        self._update_viz_checks()
-        log.info("visualization set to: %s", kind)
-
-    def _toggle_autostart(self, sender):
+    # -- live setting sync from the dashboard -------------------------
+    def _refresh_settings_from_disk(self):
+        """Pick up mic / visualization changes made via the dashboard."""
         try:
-            if autostart.is_enabled():
-                autostart.disable()
-                sender.state = 0
-                log.info("autostart disabled")
-            else:
-                autostart.enable()
-                sender.state = 1
-                log.info("autostart enabled")
+            saved_mic = config.get_selected_mic()
+            available = [name for _, name in recorder.input_devices()]
+            new_mic = saved_mic if saved_mic in available else None
+            if new_mic != self.mic.device:
+                self.mic.device = new_mic
+                log.info("mic updated from dashboard: %s",
+                         new_mic or "system default")
+            new_viz = config.get_visualization()
+            if new_viz != self.waveform.kind:
+                self.waveform.set_kind(new_viz)
+                log.info("visualization updated from dashboard: %s", new_viz)
         except Exception:
-            log.exception("autostart toggle failed")
-            self._notify("Start at Login", "Could not change this setting.")
-
-    def _edit_vocab(self, _):
-        subprocess.run(["open", str(vocab.ensure_file())], check=False)
-
-    # -- LLM settings menu ---------------------------------------------
-    def _build_llm_menu(self):
-        current = config.get_llm_provider()
-        for pid, info in config.LLM_PROVIDERS.items():
-            item = rumps.MenuItem(info["label"], callback=self._pick_llm_provider)
-            item._provider_id = pid
-            item.state = 1 if pid == current else 0
-            self._llm_provider_items[pid] = item
-            self.llm_menu.add(item)
-        self.llm_menu.add(rumps.separator)
-        self.llm_menu.add(rumps.MenuItem("Set API Key…",
-                                         callback=self._set_api_key))
-        self.llm_menu.add(rumps.MenuItem("Set Model…",
-                                         callback=self._set_llm_model))
-        self.llm_menu.add(rumps.separator)
-        self.llm_menu.add(rumps.MenuItem("Test Connection…",
-                                         callback=self._test_llm))
-
-    def _pick_llm_provider(self, sender):
-        pid = sender._provider_id
-        config.set_llm_provider(pid)
-        for k, item in self._llm_provider_items.items():
-            item.state = 1 if k == pid else 0
-        log.info("LLM provider set to: %s", pid)
-
-    def _set_api_key(self, _):
-        provider = config.get_llm_provider()
-        info = config.LLM_PROVIDERS[provider]
-        existing = config.get_secret(info["key_name"]) or ""
-        masked = ""
-        if existing:
-            masked = existing[:4] + "•" * (len(existing) - 8) + existing[-4:]
-
-        win = rumps.Window(
-            message=f"Enter your {info['label']} API key:",
-            title="MyWhisper — API Key",
-            default_text=masked,
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(420, 24),
-        )
-        resp = win.run()
-        if resp.clicked and resp.text.strip() and "•" not in resp.text:
-            config.set_secret(info["key_name"], resp.text.strip())
-            log.info("API key saved for %s", provider)
-            self._notify("API Key Saved", info["label"])
-
-    def _set_llm_model(self, _):
-        provider = config.get_llm_provider()
-        info = config.LLM_PROVIDERS[provider]
-        current_model = config.get_llm_model(provider)
-        win = rumps.Window(
-            message=(
-                f"Model name for {info['label']}:\n\n"
-                f"OpenRouter examples: anthropic/claude-sonnet-4-6, "
-                f"google/gemini-2.5-flash\n"
-                f"Anthropic examples: claude-sonnet-4-6, claude-haiku-4-5-20251001"
-            ),
-            title="MyWhisper — LLM Model",
-            default_text=current_model,
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(420, 24),
-        )
-        resp = win.run()
-        if resp.clicked and resp.text.strip():
-            config.set_llm_model(provider, resp.text.strip())
-            log.info("LLM model set to: %s (provider=%s)", resp.text.strip(), provider)
-            self._notify("Model Updated", resp.text.strip())
-
-    def _test_llm(self, _):
-        self._notify("Testing Connection…", "Sending a test message…")
-        def _run():
-            from . import llm
-            ok, msg = llm.test_connection()
-            if ok:
-                self._events.put(("notify", "Connection OK ✓",
-                                  f"{msg} is responding."))
-            else:
-                self._events.put(("notify", "Connection Failed ✗", msg))
-        threading.Thread(target=_run, daemon=True).start()
+            log.exception("settings refresh failed")
 
     def _tick_waveform(self, _):
         if self.state == "dictation":
@@ -319,6 +172,7 @@ class MyWhisperApp(rumps.App):
     # -- event loop (runs on the main thread) -------------------------
     def _poll(self, _):
         self._check_triggers()
+        self._refresh_settings_from_disk()
         try:
             while True:
                 event = self._events.get_nowait()
@@ -364,7 +218,7 @@ class MyWhisperApp(rumps.App):
         dashboard.open_dashboard()
 
     def _open_folder(self, _):
-        subprocess.run(["open", str(self.out_dir)], check=False)
+        subprocess.run(["open", str(config.app_dir())], check=False)
 
     def _click_dictation(self, _):
         if self.state == "idle":
@@ -508,7 +362,7 @@ class MyWhisperApp(rumps.App):
                 log.exception("meeting: summary failed")
                 summary_md = f"_Summary failed ({e})._"
 
-            path = output.save_meeting(self.out_dir, transcript_md, summary_md)
+            path = output.save_meeting(config.app_dir(), transcript_md, summary_md)
             log.info("meeting: saved %s", path)
             self._events.put(("notify", "Meeting notes ready", path.name))
         except Exception:

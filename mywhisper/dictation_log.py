@@ -6,14 +6,18 @@ from pathlib import Path
 from . import config
 
 _MAX_ENTRIES = 20
-_LOG_FILE = config.APP_DIR / "dictation_history.json"
 log = logging.getLogger("mywhisper")
+
+
+def _log_file():
+    return config.app_dir() / "dictation_history.json"
 
 
 def _load():
     try:
-        if _LOG_FILE.exists():
-            return json.loads(_LOG_FILE.read_text())
+        path = _log_file()
+        if path.exists():
+            return json.loads(path.read_text())
     except Exception:
         log.exception("dictation_log: failed to load")
     return []
@@ -21,8 +25,8 @@ def _load():
 
 def _save(entries):
     try:
-        config.APP_DIR.mkdir(parents=True, exist_ok=True)
-        _LOG_FILE.write_text(json.dumps(entries, indent=2))
+        config.app_dir().mkdir(parents=True, exist_ok=True)
+        _log_file().write_text(json.dumps(entries, indent=2))
     except Exception:
         log.exception("dictation_log: failed to save")
 

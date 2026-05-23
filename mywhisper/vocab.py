@@ -3,7 +3,10 @@ transcribes names, initials, and abbreviations correctly."""
 
 from . import config
 
-VOCAB_PATH = config.APP_DIR / "vocabulary.txt"
+
+def vocab_path():
+    return config.app_dir() / "vocabulary.txt"
+
 
 _HEADER = (
     "# MyWhisper Vocabulary\n"
@@ -17,18 +20,20 @@ _HEADER = (
 
 
 def ensure_file():
-    VOCAB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not VOCAB_PATH.exists():
-        VOCAB_PATH.write_text(_HEADER)
-    return VOCAB_PATH
+    path = vocab_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(_HEADER)
+    return path
 
 
 def load_terms():
+    path = vocab_path()
     try:
-        if VOCAB_PATH.exists():
+        if path.exists():
             return [
                 line.strip()
-                for line in VOCAB_PATH.read_text().splitlines()
+                for line in path.read_text().splitlines()
                 if line.strip() and not line.lstrip().startswith("#")
             ]
     except OSError:
