@@ -30,6 +30,61 @@ def chat(cfg, system, user, max_tokens=2048):
     raise LLMError(f"Unknown LLM provider: {provider!r}")
 
 
+def list_models():
+    """Fetch the list of available models from the active provider.
+
+    Returns a list of {"id": str, "label": str} dicts, or raises LLMError.
+    """
+    provider, key, _ = _active_provider()
+    if provider == "openrouter":
+        return _openrouter_models()
+    if provider == "anthropic":
+        if not key:
+            raise LLMError(
+                "Anthropic needs an API key to list models. Set it above first."
+            )
+        return _anthropic_models(key)
+    raise LLMError(f"Unknown LLM provider: {provider!r}")
+
+
+def _openrouter_models():
+    resp = requests.get(
+        "https://openrouter.ai/api/v1/models",
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", []) or []
+    models = []
+    for m in data:
+        mid = m.get("id")
+        if not mid:
+            continue
+        models.append({"id": mid, "label": m.get("name") or mid})
+    models.sort(key=lambda m: m["label"].lower())
+    return models
+
+
+def _anthropic_models(key):
+    resp = requests.get(
+        "https://api.anthropic.com/v1/models",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", []) or []
+    models = []
+    for m in data:
+        mid = m.get("id")
+        if not mid:
+            continue
+        models.append({"id": mid, "label": m.get("display_name") or mid})
+    # Newest first — Anthropic returns these created_at-sorted descending.
+    return models
+
+
 def test_connection():
     """Send a tiny request to verify the API key and model work.
 

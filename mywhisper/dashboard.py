@@ -176,6 +176,24 @@ def _act_test_llm(body):
     _call_js("onTestResult", {"ok": bool(ok), "message": str(msg)})
 
 
+def _act_fetch_models(body):
+    from . import llm
+    try:
+        models = llm.list_models()
+        _call_js("onModelsLoaded", {
+            "ok": True,
+            "models": models,
+            "provider": config.get_llm_provider(),
+        })
+    except Exception as e:
+        log.exception("dashboard: fetch_models failed")
+        _call_js("onModelsLoaded", {
+            "ok": False,
+            "error": str(e),
+            "provider": config.get_llm_provider(),
+        })
+
+
 def _act_set_mic(body):
     val = body.get("value", "")
     config.set_selected_mic(val)
@@ -286,6 +304,7 @@ _ACTIONS = {
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
     "close_panel": _act_close_panel,
+    "fetch_models": _act_fetch_models,
 }
 
 
@@ -761,50 +780,7 @@ def _build_html():
 
 <div class="content" id="settings-content">
 
-    <div class="settings-section">
-        <h3>Data Folder</h3>
-        <div class="section-desc">Where recordings, transcripts, and your config are stored.</div>
-        <div class="field-row">
-            <div class="folder-display" id="folder-display"></div>
-            <button class="btn" onclick="pickFolder()">Change…</button>
-        </div>
-        <div class="field-hint">Changing the folder copies your existing files to the new spot.</div>
-    </div>
-
-    <div class="settings-section">
-        <h3>LLM (for Meeting Summaries)</h3>
-        <div class="section-desc">Which cloud model writes your meeting notes.</div>
-
-        <div class="field">
-            <label class="field-label">Provider</label>
-            <select id="provider-select" onchange="send('set_provider', this.value)"></select>
-        </div>
-
-        <div class="field">
-            <label class="field-label">
-                API Key <span id="key-status" class="pill-status"></span>
-            </label>
-            <div class="field-row">
-                <input type="password" id="api-key-input" placeholder="Paste your key…">
-                <button class="btn" onclick="saveApiKey()">Save</button>
-            </div>
-            <div class="field-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
-        </div>
-
-        <div class="field">
-            <label class="field-label">Model</label>
-            <div class="field-row">
-                <input type="text" id="model-input" placeholder="e.g. anthropic/claude-sonnet-4-6">
-                <button class="btn" onclick="saveModel()">Save</button>
-            </div>
-        </div>
-
-        <div class="field">
-            <button class="btn" onclick="testLLM()">Test Connection</button>
-            <div id="test-result"></div>
-        </div>
-    </div>
-
+    <!-- 1. Meeting Type Presets — most frequently changed -->
     <div class="settings-section">
         <h3>Meeting Type Presets</h3>
         <div class="section-desc">Pick the default below — you can choose a different one each time from the Start Meeting submenu.</div>
@@ -839,6 +815,67 @@ def _build_html():
         </div>
     </div>
 
+    <!-- 2. LLM — provider/key/model -->
+    <div class="settings-section">
+        <h3>LLM (for Meeting Summaries)</h3>
+        <div class="section-desc">Which cloud model writes your meeting notes.</div>
+
+        <div class="field">
+            <label class="field-label">Provider</label>
+            <select id="provider-select" onchange="send('set_provider', this.value)"></select>
+        </div>
+
+        <div class="field">
+            <label class="field-label">
+                API Key <span id="key-status" class="pill-status"></span>
+            </label>
+            <div class="field-row">
+                <input type="password" id="api-key-input" placeholder="Paste your key…">
+                <button class="btn" onclick="saveApiKey()">Save</button>
+            </div>
+            <div class="field-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
+        </div>
+
+        <div class="field">
+            <label class="field-label">
+                Model
+                <span id="model-status" class="field-hint" style="margin-left: 6px;"></span>
+            </label>
+            <div class="field-row">
+                <select id="model-select" onchange="onModelPicked()" style="flex: 1;">
+                    <option value="">Loading models…</option>
+                </select>
+                <button class="btn btn-ghost" onclick="refreshModels()" title="Reload list from provider">↻</button>
+            </div>
+            <div class="field-hint">List comes straight from the provider. Pick "Other…" to type a model name manually.</div>
+        </div>
+
+        <div class="field" id="model-manual-row" style="display: none;">
+            <label class="field-label">Custom Model ID</label>
+            <div class="field-row">
+                <input type="text" id="model-input" placeholder="exact model identifier">
+                <button class="btn" onclick="saveModel()">Save</button>
+            </div>
+        </div>
+
+        <div class="field">
+            <button class="btn" onclick="testLLM()">Test Connection</button>
+            <div id="test-result"></div>
+        </div>
+    </div>
+
+    <!-- 3. Vocabulary — occasionally edited -->
+    <div class="settings-section">
+        <h3>Vocabulary</h3>
+        <div class="section-desc">Custom terms — one per line. Whisper uses these as a hint so it gets names and abbreviations right.</div>
+        <textarea id="vocab-text" placeholder="# One term per line — company names, initials, jargon."></textarea>
+        <div class="field-row" style="margin-top: 8px;">
+            <button class="btn" onclick="saveVocab()">Save Vocabulary</button>
+            <span id="vocab-status" class="field-hint"></span>
+        </div>
+    </div>
+
+    <!-- 4. Microphone & Visualization — set once usually -->
     <div class="settings-section">
         <h3>Microphone &amp; Visualization</h3>
 
@@ -856,22 +893,24 @@ def _build_html():
         </div>
     </div>
 
-    <div class="settings-section">
-        <h3>Vocabulary</h3>
-        <div class="section-desc">Custom terms — one per line. Whisper uses these as a hint so it gets names and abbreviations right.</div>
-        <textarea id="vocab-text" placeholder="# One term per line — company names, initials, jargon."></textarea>
-        <div class="field-row" style="margin-top: 8px;">
-            <button class="btn" onclick="saveVocab()">Save Vocabulary</button>
-            <span id="vocab-status" class="field-hint"></span>
-        </div>
-    </div>
-
+    <!-- 5. System — set once -->
     <div class="settings-section">
         <h3>System</h3>
         <label class="toggle">
             <input type="checkbox" id="autostart-toggle" onchange="send('set_autostart', this.checked)">
             <span class="toggle-label">Start MyWhisper automatically at login</span>
         </label>
+    </div>
+
+    <!-- 6. Data Folder — advanced, rarely changed -->
+    <div class="settings-section">
+        <h3>Data Folder</h3>
+        <div class="section-desc">Where recordings, transcripts, and your config are stored. Set once.</div>
+        <div class="field-row">
+            <div class="folder-display" id="folder-display"></div>
+            <button class="btn" onclick="pickFolder()">Change…</button>
+        </div>
+        <div class="field-hint">Changing the folder copies your existing files to the new spot.</div>
     </div>
 
 </div>
@@ -983,7 +1022,10 @@ function renderState(s) {{
         $('api-key-input').placeholder = 'Paste your key…';
     }}
 
+    // Model dropdown is populated asynchronously by refreshModels();
+    // keep the manual text field in sync with the current saved model.
     $('model-input').value = s.llm_model || '';
+    syncModelDropdown(s.llm_model || '');
 
     // Mic dropdown
     const msel = $('mic-select');
@@ -1114,7 +1156,98 @@ function savePresetEdit() {{
     $('preset-editor').style.display = 'none';
 }}
 
+// --- Model dropdown -----------------------------------------------------
+
+let _modelList = [];      // last-fetched [{id, label}]
+let _lastProvider = '';   // refetch when this changes
+
+function syncModelDropdown(currentId) {{
+    const sel = $('model-select');
+    sel.innerHTML = '';
+    if (_modelList.length === 0) {{
+        const opt = document.createElement('option');
+        opt.value = currentId || '';
+        opt.textContent = currentId ? currentId + ' (saved)' : 'Loading models…';
+        sel.appendChild(opt);
+    }} else {{
+        let matched = false;
+        _modelList.forEach(m => {{
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.label;
+            if (m.id === currentId) {{ opt.selected = true; matched = true; }}
+            sel.appendChild(opt);
+        }});
+        // If the saved model isn't in the fetched list, show it as a
+        // disabled item at the top so the user can see what's saved.
+        if (currentId && !matched) {{
+            const opt = document.createElement('option');
+            opt.value = currentId;
+            opt.textContent = currentId + ' (saved, not in current list)';
+            opt.selected = true;
+            sel.insertBefore(opt, sel.firstChild);
+        }}
+        const other = document.createElement('option');
+        other.value = '__other__';
+        other.textContent = 'Other… (type a model name)';
+        sel.appendChild(other);
+    }}
+    // Show manual row if Other is selected
+    $('model-manual-row').style.display =
+        (sel.value === '__other__') ? 'block' : 'none';
+}}
+
+function refreshModels() {{
+    $('model-status').textContent = 'Loading…';
+    send('fetch_models', null);
+}}
+
+window.onModelsLoaded = function(payload) {{
+    if (payload.ok) {{
+        _modelList = payload.models || [];
+        $('model-status').textContent = _modelList.length + ' available';
+        syncModelDropdown($('model-input').value);
+    }} else {{
+        _modelList = [];
+        $('model-status').textContent = '⚠ ' + (payload.error || 'load failed');
+        syncModelDropdown($('model-input').value);
+    }}
+}};
+
+function onModelPicked() {{
+    const sel = $('model-select');
+    const v = sel.value;
+    if (v === '__other__') {{
+        $('model-manual-row').style.display = 'block';
+        $('model-input').focus();
+        return;
+    }}
+    $('model-manual-row').style.display = 'none';
+    if (v) {{
+        $('model-input').value = v;
+        send('set_model', v);
+    }}
+}}
+
 renderState(initialState);
+
+// Fetch models in the background on first open. Also refetch whenever
+// the provider dropdown changes (provider is in the state pushed back
+// after set_provider).
+refreshModels();
+
+(function() {{
+    _lastProvider = initialState.llm_provider;
+    const origOnState = window.onState;
+    window.onState = function(state) {{
+        if (state.llm_provider !== _lastProvider) {{
+            _lastProvider = state.llm_provider;
+            _modelList = [];   // clear stale list before refetching
+            refreshModels();
+        }}
+        origOnState(state);
+    }};
+}})();
 </script>
 </body>
 </html>"""
