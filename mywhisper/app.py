@@ -438,15 +438,18 @@ class MyWhisperApp(rumps.App):
             provider_name = config.LLM_PROVIDERS[config.get_llm_provider()]["label"]
             model_name = config.get_llm_model(config.get_llm_provider()) or "(not set)"
             summary_failed = False
+            title = ""
             try:
                 log.info("meeting: summarizing via LLM (provider=%s, model=%s)",
                          provider_name, model_name)
-                summary_md = summarize.summarize_transcript(
+                title, summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
                 )
                 if not summary_md or not summary_md.strip():
                     raise RuntimeError("Empty summary returned by LLM.")
+                if title:
+                    log.info("meeting: title = %r", title)
             except Exception as e:
                 log.exception("meeting: summary failed")
                 summary_failed = True
@@ -464,13 +467,16 @@ class MyWhisperApp(rumps.App):
                     "re-run with a working setup."
                 )
 
-            path = output.save_meeting(config.app_dir(), transcript_md, summary_md)
+            path = output.save_meeting(config.app_dir(), transcript_md,
+                                       summary_md, title=title)
             log.info("meeting: saved %s", path)
             if summary_failed:
                 self._events.put(("notify", "Meeting saved (summary failed)",
                                   "Check the file for details."))
             else:
-                self._events.put(("notify", "Meeting notes ready", path.name))
+                self._events.put(("notify",
+                                  title or "Meeting notes ready",
+                                  path.name))
         except Exception:
             log.exception("meeting: failed")
             self._events.put(("notify", "Meeting failed",

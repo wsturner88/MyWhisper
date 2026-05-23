@@ -42,14 +42,20 @@ def _call_llm(cfg, system, user, max_tokens, label=""):
 
 
 def summarize_transcript(cfg, transcript_text, preset_id=None):
-    """Chunked summarization, with prompts shaped by the selected preset."""
+    """Chunked summarization, with prompts shaped by the selected preset.
+
+    Returns a (title, summary_md) tuple. Title is a short LLM-generated
+    label (e.g. 'Sales call with Acme — pricing review'). If the title
+    pass fails, returns an empty title and the caller falls back to a
+    timestamp-only filename.
+    """
     preset_id = preset_id or config.get_meeting_preset()
     preset = config.MEETING_PRESETS.get(preset_id, config.MEETING_PRESETS["general"])
     system = _system_prompt(preset)
 
     chunks = _chunks(transcript_text)
     if not chunks:
-        return "## Summary\n- (empty transcript)\n"
+        return "", "## Summary\n- (empty transcript)\n"
 
     if len(chunks) == 1:
         notes = chunks
@@ -73,7 +79,53 @@ def summarize_transcript(cfg, transcript_text, preset_id=None):
         f"Lean into {preset['focus']}.\n\n"
         f"{combined}"
     )
-    return _call_llm(cfg, system, final, max_tokens=2048, label="final pass")
+    summary = _call_llm(cfg, system, final, max_tokens=2048, label="final pass")
+    title = _generate_title(cfg, summary, transcript_text)
+    return title, summary
+
+
+def _generate_title(cfg, summary, transcript):
+    """Ask the LLM for a short title summarizing the meeting. Returns ''
+    on failure — caller falls back to a timestamp-only filename."""
+    # Use the summary if we have one; otherwise fall back to a chunk of
+    # the raw transcript.
+    source = (summary or transcript or "").strip()
+    if not source:
+        return ""
+    source = source[:1500]  # keep the prompt short
+    system = (
+        "You produce short, descriptive titles for meeting notes. "
+        "Reply with ONLY the title — no quotes, no explanation, "
+        "no trailing punctuation."
+    )
+    user = (
+        "In 3 to 7 words, give a title that captures what this meeting was "
+        "about. Use plain English. No quotes.\n\n"
+        f"{source}"
+    )
+    try:
+        title = llm.chat(cfg, system, user, max_tokens=40)
+    except Exception:
+        log.exception("title generation failed")
+        return ""
+    return _clean_title(title)
+
+
+def _clean_title(raw):
+    """Strip quotes, punctuation, and excess whitespace from an LLM title."""
+    if not raw:
+        return ""
+    t = raw.strip()
+    # Drop leading 'Title:' / 'Meeting Title:' if the model added one
+    for prefix in ("Title:", "Meeting Title:", "TITLE:"):
+        if t.lower().startswith(prefix.lower()):
+            t = t[len(prefix):].strip()
+    # Strip surrounding quotes / brackets / trailing periods
+    t = t.strip("\"'`*_[]() \t")
+    t = t.rstrip(".")
+    # Collapse internal whitespace
+    t = " ".join(t.split())
+    return t[:80]  # hard cap
 
 
 def cleanup_dictation(cfg, text):
