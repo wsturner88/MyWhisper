@@ -181,15 +181,54 @@ class MyWhisperApp(rumps.App):
 
     # -- live setting sync from the dashboard -------------------------
     def _refresh_settings_from_disk(self):
-        """Pick up mic / visualization changes made via the dashboard."""
+        """Pick up mic / visualization changes made via the dashboard,
+        and notice when audio devices are hot-plugged."""
         try:
+            # Refresh PortAudio's device cache at most every 3s, and only
+            # when idle (re-init kills active mic streams).
+            now = time.monotonic()
+            last = getattr(self, "_last_device_refresh", 0.0)
+            do_refresh = (
+                self.state == "idle"
+                and (now - last) >= 3.0
+            )
+            if do_refresh:
+                self._last_device_refresh = now
+            available = [name for _, name in recorder.input_devices(
+                refresh=do_refresh)]
+
+            # Detect hot-plug changes (new mic plugged in, mic unplugged).
+            prev = getattr(self, "_known_devices", None)
+            if prev is None:
+                # First poll — just record the baseline silently.
+                self._known_devices = list(available)
+            elif tuple(available) != tuple(prev):
+                added = [d for d in available if d not in prev]
+                removed = [d for d in prev if d not in available]
+                self._known_devices = list(available)
+                for d in added:
+                    log.info("audio device added: %s", d)
+                for d in removed:
+                    log.info("audio device removed: %s", d)
+                # Tell the user about new mics (most common useful event).
+                if added:
+                    label = added[0] if len(added) == 1 \
+                        else f"{len(added)} new mics"
+                    self._notify(
+                        "New microphone available",
+                        f"{label} — pick it in Settings if you want to use it.",
+                    )
+                # If the dashboard panel is open, refresh its mic dropdown.
+                try:
+                    dashboard._push_state()
+                except Exception:
+                    pass
+
             saved_mic = config.get_selected_mic()
-            available = [name for _, name in recorder.input_devices()]
             new_mic = saved_mic if saved_mic in available else None
             if new_mic != self.mic.device:
                 self.mic.device = new_mic
-                log.info("mic updated from dashboard: %s",
-                         new_mic or "system default")
+                log.info("mic updated: %s", new_mic or "system default")
             new_viz = config.get_visualization()
             if new_viz != self.waveform.kind:
                 self.waveform.set_kind(new_viz)

@@ -8,8 +8,20 @@ import sounddevice as sd
 import soundfile as sf
 
 
-def input_devices():
-    """List (index, name) for every available input device."""
+def input_devices(refresh=False):
+    """List (index, name) for every available input device.
+
+    PortAudio caches its device list on first init. When `refresh=True`,
+    we ask PortAudio to re-enumerate so newly-plugged mics show up
+    without restarting the app. Caller must ensure no stream is active
+    when refreshing — re-init kills active streams.
+    """
+    if refresh:
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
     devices = []
     try:
         for index, dev in enumerate(sd.query_devices()):

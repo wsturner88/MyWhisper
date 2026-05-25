@@ -86,6 +86,9 @@ def _state_snapshot():
     masked = (api_key[:4] + "•" * 6 + api_key[-4:]) if len(api_key) >= 12 else ""
 
     try:
+        # The app's poll loop handles refreshing PortAudio's device list
+        # on a throttle (and only when idle). Here we just read whatever
+        # is currently cached — cheap and never disrupts a recording.
         mic_devices = [name for _, name in recorder.input_devices()]
     except Exception:
         mic_devices = []
