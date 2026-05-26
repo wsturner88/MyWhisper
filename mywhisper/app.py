@@ -203,6 +203,10 @@ class MyWhisperApp(rumps.App):
                 # First poll — just record the baseline silently.
                 self._known_devices = list(available)
             elif tuple(available) != tuple(prev):
+                # Just log it and push state — the dashboard mic dropdown
+                # updates live. No notification: macOS Continuity pops the
+                # iPhone in and out constantly during calls, and for normal
+                # plug-ins the user already knows what they did.
                 added = [d for d in available if d not in prev]
                 removed = [d for d in prev if d not in available]
                 self._known_devices = list(available)
@@ -210,15 +214,6 @@ class MyWhisperApp(rumps.App):
                     log.info("audio device added: %s", d)
                 for d in removed:
                     log.info("audio device removed: %s", d)
-                # Tell the user about new mics (most common useful event).
-                if added:
-                    label = added[0] if len(added) == 1 \
-                        else f"{len(added)} new mics"
-                    self._notify(
-                        "New microphone available",
-                        f"{label} — pick it in Settings if you want to use it.",
-                    )
-                # If the dashboard panel is open, refresh its mic dropdown.
                 try:
                     dashboard._push_state()
                 except Exception:
