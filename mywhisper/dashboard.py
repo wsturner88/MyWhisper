@@ -21,7 +21,7 @@ from AppKit import (
 )
 from Foundation import NSURL as FNSURL
 
-from . import config, dictation_log, autostart, vocab, recorder
+from . import config, dictation_log, autostart, vocab, recorder, screen_recording
 
 log = logging.getLogger("mywhisper")
 
@@ -113,6 +113,7 @@ def _state_snapshot():
         "mic_devices": mic_devices,
         "visualization": config.get_visualization(),
         "autostart": autostart.is_enabled(),
+        "screen_recording_granted": screen_recording.has_permission(),
         "vocabulary": _load_vocab_text(),
         "meeting_preset": config.get_meeting_preset(),
         "builtin_presets": [
@@ -276,6 +277,15 @@ def _act_delete_custom_preset(body):
     _push_state()
 
 
+def _act_request_screen_recording(body):
+    screen_recording.request_permission()
+    _push_state()
+
+
+def _act_open_screen_recording_settings(body):
+    screen_recording.open_settings()
+
+
 def _act_close_panel(body):
     try:
         if _panel is not None:
@@ -327,6 +337,8 @@ _ACTIONS = {
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
     "set_custom_url": _act_set_custom_url,
+    "request_screen_recording": _act_request_screen_recording,
+    "open_screen_recording_settings": _act_open_screen_recording_settings,
 }
 
 
@@ -964,7 +976,24 @@ def _build_html():
         </div>
     </div>
 
-    <!-- 5. System — set once -->
+    <!-- 5. System Audio (for Meeting Recording) -->
+    <div class="settings-section">
+        <h3>System Audio (for Meeting Recording)</h3>
+        <div class="section-desc">macOS gates capture of the other side of your Zoom/Teams calls behind Screen Recording permission. Grant it once and meeting recordings include everyone's audio, not just your microphone.</div>
+
+        <div class="field">
+            <label class="field-label">
+                Screen Recording <span id="sr-status" class="pill-status"></span>
+            </label>
+            <div class="field-row">
+                <button class="btn" onclick="send('request_screen_recording', null)">Request / Test</button>
+                <button class="btn btn-ghost" onclick="send('open_screen_recording_settings', null)">Open System Settings</button>
+            </div>
+            <div class="field-hint" id="sr-hint"></div>
+        </div>
+    </div>
+
+    <!-- 6. System — set once -->
     <div class="settings-section">
         <h3>System</h3>
         <label class="toggle">
@@ -1172,6 +1201,19 @@ function renderState(s) {{
 
     $('viz-select').value = s.visualization;
     $('autostart-toggle').checked = s.autostart;
+
+    // Screen Recording permission status
+    const srPill = $('sr-status');
+    const srHint = $('sr-hint');
+    if (s.screen_recording_granted) {{
+        srPill.className = 'pill-status ok';
+        srPill.textContent = 'Granted';
+        srHint.textContent = 'Both sides of your calls will be captured. ✓';
+    }} else {{
+        srPill.className = 'pill-status missing';
+        srPill.textContent = 'Not granted';
+        srHint.textContent = 'Click Request/Test to trigger the macOS prompt. If you previously denied, that prompt won\\'t show again — use Open System Settings to flip it on manually (under Screen Recording → python3.12).';
+    }}
     $('vocab-text').value = s.vocabulary;
 
     // Built-in presets — picker only (no edit/delete)

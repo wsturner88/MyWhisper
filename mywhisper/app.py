@@ -12,8 +12,8 @@ import rumps
 
 from . import (audio, autostart, calendar_lookup, config, dashboard, diarize,
                dictation_log, hotkeys, meeting_indicator, notes_pad, output,
-               paste, recorder, sounds, summarize, transcribe, vocab,
-               waveform)
+               paste, recorder, screen_recording, sounds, summarize,
+               transcribe, vocab, waveform)
 
 HELPER_NAME = "mywhisper-sysaudio"
 
@@ -148,6 +148,19 @@ class MyWhisperApp(rumps.App):
                 log.info("calendar access: %s", calendar_lookup.status_label())
         except Exception:
             log.exception("calendar permission request failed")
+
+        # Screen Recording permission gates ScreenCaptureKit, which is how
+        # we capture the other side of Zoom/Teams calls. Log it loudly so
+        # the user can see in the log if it's missing — and we surface it
+        # in the dashboard too.
+        try:
+            sr_ok = screen_recording.has_permission()
+            log.info("screen recording (system audio) permission: %s",
+                     "GRANTED" if sr_ok else "NOT GRANTED — meetings will "
+                     "capture mic-only until you grant it in Dashboard → "
+                     "Settings → System Audio")
+        except Exception:
+            log.exception("screen recording permission check failed")
 
         log.info("app ready (provider=%s, model=%s)",
                  self.cfg["llm"]["provider"], self.cfg["whisper"]["model"])
@@ -395,10 +408,20 @@ class MyWhisperApp(rumps.App):
         self._sync()
         self.meeting_panel.show()
         self.notes_panel.show()
-        if not self.sysaudio.start(_tmp_wav()):
+        self._sysaudio_ok = self.sysaudio.start(_tmp_wav())
+        if not self._sysaudio_ok:
             log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
-            self._notify("System audio unavailable",
-                         f"{self.sysaudio.error or ''} Recording microphone only.")
+            # Distinguish permission denial from other failures.
+            err = (self.sysaudio.error or "").lower()
+            if "declined" in err or "tcc" in err or not screen_recording.has_permission():
+                self._notify(
+                    "Mic-only meeting (no system audio)",
+                    "Screen Recording permission not granted — open Dashboard "
+                    "→ Settings → System Audio to fix.")
+            else:
+                self._notify(
+                    "System audio unavailable",
+                    f"{self.sysaudio.error or ''} Recording microphone only.")
 
     def _click_stop_meeting(self, _):
         """Stop button clicked while a meeting is recording."""
@@ -550,6 +573,17 @@ class MyWhisperApp(rumps.App):
                     "below — once the LLM works, you can paste it into "
                     "ChatGPT/Claude manually for a one-time summary, or "
                     "re-run with a working setup."
+                )
+
+            # If system audio failed, prepend a small banner to the
+            # summary so the user always knows what they're looking at.
+            if not getattr(self, "_sysaudio_ok", True):
+                summary_md = (
+                    "> ⚠️ **Microphone-only recording.** The other side of "
+                    "the conversation was not captured because Screen "
+                    "Recording permission is not granted. Open Dashboard → "
+                    "Settings → System Audio to fix for next time.\n\n"
+                    + summary_md
                 )
 
             self._stage("Saving notes…")
