@@ -362,7 +362,13 @@ def _build_html():
                     <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
                     <span class="chevron" id="chev-{i}">&#9654;</span>
                 </div>
-                <pre class="card-body" id="meeting-{i}">{safe_content}</pre>
+                <div class="card-body" id="meeting-{i}">
+                    <div class="card-body-toolbar">
+                        <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
+                        <button class="close-btn-inline" onclick="toggleMeeting({i}); event.stopPropagation();">&times; Close</button>
+                    </div>
+                    <pre class="card-body-content">{safe_content}</pre>
+                </div>
             </div>"""
 
     dictations_html = ""
@@ -517,19 +523,52 @@ def _build_html():
     .chevron.open {{ transform: rotate(90deg); }}
     .card-body {{
         display: none;
-        padding: 0 14px 14px;
+        max-height: 380px;
+        overflow-y: auto;
+        position: relative;
+    }}
+    .card-body.open {{ display: block; }}
+    .card-body-toolbar {{
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+        padding: 8px 14px;
+        background: linear-gradient(to bottom,
+            var(--surface) 0%,
+            var(--surface) 85%,
+            rgba(34, 34, 68, 0) 100%);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }}
+    .card-body-content {{
+        padding: 4px 14px 14px;
+        margin: 0;
         font-size: 12px;
         line-height: 1.6;
         color: var(--text2);
         white-space: pre-wrap;
         word-wrap: break-word;
         font-family: inherit;
-        max-height: 350px;
-        overflow-y: auto;
         -webkit-user-select: text;
         user-select: text;
     }}
-    .card-body.open {{ display: block; }}
+    .close-btn-inline {{
+        background: transparent;
+        color: var(--text2);
+        border: 1px solid #555;
+        padding: 5px 11px;
+        border-radius: 6px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }}
+    .close-btn-inline:hover {{
+        background: var(--surface2);
+        color: var(--text);
+        border-color: #777;
+    }}
     .dict-text {{
         padding: 0 14px 12px;
         font-size: 13px;
