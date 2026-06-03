@@ -1,3 +1,4 @@
+import json
 import requests
 
 from . import config
@@ -16,19 +17,24 @@ def _active_provider():
     return provider, key, model
 
 
-def chat(cfg, system, user, max_tokens=2048):
+def chat(cfg, system, user, max_tokens=2048, on_token=None):
+    """Run an LLM chat. If on_token is provided, stream tokens to it as
+    they arrive (called with each text chunk). Always returns the full
+    response text at the end.
+
+    For older non-streaming callers, just omit on_token.
+    """
     provider, key, model = _active_provider()
     info = config.LLM_PROVIDERS[provider]
-    # Only require the key if it's *not* marked optional.
     if info.get("key_name") and not info.get("key_optional") and not key:
         raise LLMError(
             f"No API key set for {info['label']}. "
             f"Set it in MyWhisper → Dashboard → Settings → LLM."
         )
     if provider == "openrouter":
-        return _openrouter(key, model, system, user, max_tokens)
+        return _openrouter(key, model, system, user, max_tokens, on_token)
     if provider == "anthropic":
-        return _anthropic(key, model, system, user, max_tokens)
+        return _anthropic(key, model, system, user, max_tokens, on_token)
     if provider == "custom":
         url = config.get_custom_llm_url()
         if not url:
@@ -40,7 +46,8 @@ def chat(cfg, system, user, max_tokens=2048):
                 "No model selected. Pick one from the dropdown after the "
                 "server connects."
             )
-        return _custom_chat(url, model, system, user, max_tokens, auth_token=key)
+        return _custom_chat(url, model, system, user, max_tokens,
+                            auth_token=key, on_token=on_token)
     raise LLMError(f"Unknown LLM provider: {provider!r}")
 
 
@@ -164,7 +171,26 @@ def test_connection():
         return False, str(e)
 
 
-def _openrouter(key, model, system, user, max_tokens):
+def _openrouter(key, model, system, user, max_tokens, on_token=None):
+    if on_token is None:
+        # Non-streaming fast path
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max_tokens,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    # Streaming via OpenAI-style SSE
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {key}"},
@@ -175,14 +201,36 @@ def _openrouter(key, model, system, user, max_tokens):
                 {"role": "user", "content": user},
             ],
             "max_tokens": max_tokens,
+            "stream": True,
         },
-        timeout=30,
+        stream=True,
+        timeout=600,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    return _consume_openai_sse(resp, on_token)
 
 
-def _anthropic(key, model, system, user, max_tokens):
+def _anthropic(key, model, system, user, max_tokens, on_token=None):
+    if on_token is None:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"].strip()
+
+    # Streaming via Anthropic SSE
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -195,11 +243,65 @@ def _anthropic(key, model, system, user, max_tokens):
             "max_tokens": max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
+            "stream": True,
         },
-        timeout=30,
+        stream=True,
+        timeout=600,
     )
     resp.raise_for_status()
-    return resp.json()["content"][0]["text"].strip()
+    return _consume_anthropic_sse(resp, on_token)
+
+
+def _consume_openai_sse(resp, on_token):
+    """OpenAI-style SSE: 'data: {json}\\n\\n' lines with content deltas."""
+    full = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        try:
+            delta = obj["choices"][0]["delta"].get("content") or ""
+        except (KeyError, IndexError):
+            delta = ""
+        if delta:
+            full.append(delta)
+            try:
+                on_token(delta)
+            except Exception:
+                pass
+    return "".join(full).strip()
+
+
+def _consume_anthropic_sse(resp, on_token):
+    """Anthropic SSE: 'event: ...' and 'data: {json}' lines.
+    Text deltas live in `content_block_delta` events under .delta.text.
+    """
+    full = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if obj.get("type") == "content_block_delta":
+            delta = (obj.get("delta") or {}).get("text") or ""
+            if delta:
+                full.append(delta)
+                try:
+                    on_token(delta)
+                except Exception:
+                    pass
+        elif obj.get("type") == "message_stop":
+            break
+    return "".join(full).strip()
 
 
 # -- Custom LLM (Ollama / OpenAI-compatible self-hosted) -------------------
@@ -282,31 +384,64 @@ def _custom_models(url, auth_token=None):
     return models
 
 
-def _custom_chat(url, model, system, user, max_tokens, auth_token=None):
+def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
+                 on_token=None):
     base = _custom_base(url)
     style = _detect_custom_api(base, auth_token=auth_token)
     headers = _auth_headers(auth_token)
     if style == "ollama":
+        if on_token is None:
+            r = requests.post(
+                f"{base}/api/chat", headers=headers,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "stream": False,
+                    "options": {"num_predict": max_tokens},
+                },
+                timeout=600,
+            )
+            r.raise_for_status()
+            return (r.json().get("message", {}).get("content") or "").strip()
+        # Streaming Ollama — line-delimited JSON, each line has .message.content
         r = requests.post(
-            f"{base}/api/chat",
-            headers=headers,
+            f"{base}/api/chat", headers=headers,
             json={
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "stream": False,
+                "stream": True,
                 "options": {"num_predict": max_tokens},
+            },
+            stream=True,
+            timeout=600,
+        )
+        r.raise_for_status()
+        return _consume_ollama_stream(r, on_token)
+    # openai-compatible
+    if on_token is None:
+        r = requests.post(
+            f"{base}/v1/chat/completions", headers=headers,
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max_tokens,
             },
             timeout=600,
         )
         r.raise_for_status()
-        return (r.json().get("message", {}).get("content") or "").strip()
-    # openai-compatible
+        return r.json()["choices"][0]["message"]["content"].strip()
+    # Streaming openai-compat (LM Studio, vLLM, etc.)
     r = requests.post(
-        f"{base}/v1/chat/completions",
-        headers=headers,
+        f"{base}/v1/chat/completions", headers=headers,
         json={
             "model": model,
             "messages": [
@@ -314,8 +449,33 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None):
                 {"role": "user", "content": user},
             ],
             "max_tokens": max_tokens,
+            "stream": True,
         },
+        stream=True,
         timeout=600,
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    return _consume_openai_sse(r, on_token)
+
+
+def _consume_ollama_stream(resp, on_token):
+    """Ollama streams newline-delimited JSON. Each line has
+    {'message': {'content': '...'}} until done==true."""
+    full = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        delta = (obj.get("message") or {}).get("content") or ""
+        if delta:
+            full.append(delta)
+            try:
+                on_token(delta)
+            except Exception:
+                pass
+        if obj.get("done"):
+            break
+    return "".join(full).strip()

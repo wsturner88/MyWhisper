@@ -21,15 +21,32 @@ def _chunks(text, size=CHUNK_WORDS):
     return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
 
 
-def _call_llm(cfg, system, user, max_tokens, label=""):
-    """Call the LLM with one warm-up retry if the first response is empty."""
-    reply = llm.chat(cfg, system, user, max_tokens=max_tokens)
+def _call_llm(cfg, system, user, max_tokens, label="", on_progress=None):
+    """Call the LLM with one warm-up retry if the first response is empty.
+
+    on_progress(text_delta, total_chars) is called as tokens stream in
+    so the UI can show live progress. If on_progress is None, runs
+    non-streaming (faster path).
+    """
+    on_token = None
+    if on_progress is not None:
+        # Wrap the per-token callback to also keep a running char count
+        state = {"chars": 0}
+
+        def on_token(delta):
+            state["chars"] += len(delta)
+            try:
+                on_progress(delta, state["chars"])
+            except Exception:
+                pass
+
+    reply = llm.chat(cfg, system, user, max_tokens=max_tokens, on_token=on_token)
     if reply and reply.strip():
         log.info("LLM %s: %d chars returned", label, len(reply))
         return reply
     log.warning("LLM %s: empty response, retrying after 2s warm-up", label)
     time.sleep(2)
-    reply = llm.chat(cfg, system, user, max_tokens=max_tokens)
+    reply = llm.chat(cfg, system, user, max_tokens=max_tokens, on_token=on_token)
     if reply and reply.strip():
         log.info("LLM %s (retry): %d chars returned", label, len(reply))
         return reply
@@ -42,20 +59,48 @@ def _call_llm(cfg, system, user, max_tokens, label=""):
 
 
 def summarize_transcript(cfg, transcript_text, preset_id=None,
-                         calendar_event=None):
+                         calendar_event=None, live_notes="",
+                         on_stage=None):
     """Chunked summarization, with prompts shaped by the selected preset.
 
-    `calendar_event` is an optional dict from calendar_lookup; if provided
-    its title/attendees/notes/organizer are fed into the prompts so the
-    summary uses real names instead of 'Speaker 1'.
+    `calendar_event` is an optional dict from calendar_lookup (title,
+    attendees, organizer, notes) — fed into the prompt so the summary
+    uses real names instead of 'Speaker 1'.
 
-    Returns (title, summary_md). Calendar title (if any) wins over the
-    LLM-generated one — the caller is responsible for that choice.
+    `live_notes` is freeform text the user typed in the notes pad while
+    the meeting was being recorded — names, corrections, context. It's
+    treated as authoritative ground-truth and added to the prompt.
+
+    `on_stage(stage_text, chars_so_far)` is called as progress updates
+    arrive — e.g. on_stage('Chunk 2 of 5', 0), then on_stage('Chunk 2
+    of 5', 247) as tokens stream in. Lets the UI show real-time
+    progress instead of a blocking spinner.
+
+    Returns (title, summary_md).
     """
     preset_id = preset_id or config.get_meeting_preset()
     preset = config.MEETING_PRESETS.get(preset_id, config.MEETING_PRESETS["general"])
     system = _system_prompt(preset)
     cal_block = calendar_lookup.context_block(calendar_event)
+    notes_block = _user_notes_block(live_notes)
+
+    def _stage(label):
+        if on_stage:
+            try:
+                on_stage(label, 0)
+            except Exception:
+                pass
+
+    def _stage_progress_factory(label):
+        if on_stage is None:
+            return None
+
+        def _cb(_delta, total_chars):
+            try:
+                on_stage(label, total_chars)
+            except Exception:
+                pass
+        return _cb
 
     chunks = _chunks(transcript_text)
     if not chunks:
@@ -66,32 +111,53 @@ def summarize_transcript(cfg, transcript_text, preset_id=None,
     else:
         notes = []
         for i, chunk in enumerate(chunks, 1):
+            stage_label = f"Summarizing part {i} of {len(chunks)}"
+            _stage(stage_label)
             user = (
                 f"This is part {i} of {len(chunks)} of a meeting transcript "
                 f"for a **{preset['label']}**.\n\n"
-                f"{cal_block}\n"
+                f"{cal_block}{notes_block}\n"
                 f"Pull out {preset['focus']} from this part. Use the real "
                 f"attendee names from the calendar context above instead of "
                 f"'Speaker 1' / 'Speaker 2' where you can tell who spoke.\n\n"
                 f"Transcript part:\n{chunk}"
             )
-            notes.append(_call_llm(cfg, system, user, max_tokens=1024,
-                                   label=f"chunk {i}/{len(chunks)}"))
+            notes.append(_call_llm(
+                cfg, system, user, max_tokens=1024,
+                label=f"chunk {i}/{len(chunks)}",
+                on_progress=_stage_progress_factory(stage_label),
+            ))
 
     combined = "\n\n".join(notes)
+    _stage("Writing final summary")
     final = (
         f"Below are notes from a **{preset['label']}**.\n\n"
-        f"{cal_block}\n"
+        f"{cal_block}{notes_block}\n"
         f"Produce final meeting notes in Markdown with exactly these sections:\n\n"
         "## Summary\n## Key Decisions\n## Action Items\n## Open Questions\n\n"
         f"Use bullet points. Use real attendee names from the calendar "
-        f"context where possible. If a section has nothing, write "
-        f"'- None'. Lean into {preset['focus']}.\n\n"
+        f"context where possible. If the user's notes flag specific facts "
+        f"(spellings, names, decisions), treat those as authoritative. If a "
+        f"section has nothing, write '- None'. Lean into {preset['focus']}.\n\n"
         f"{combined}"
     )
-    summary = _call_llm(cfg, system, final, max_tokens=2048, label="final pass")
+    summary = _call_llm(
+        cfg, system, final, max_tokens=2048, label="final pass",
+        on_progress=_stage_progress_factory("Writing final summary"),
+    )
+    _stage("Generating title")
     title = _generate_title(cfg, summary, transcript_text)
     return title, summary
+
+
+def _user_notes_block(live_notes):
+    """Format the user's typed live notes for the LLM prompt."""
+    if not live_notes or not live_notes.strip():
+        return ""
+    return (
+        "### Notes from the user (typed during the meeting — authoritative)\n"
+        f"{live_notes.strip()}\n\n"
+    )
 
 
 def _generate_title(cfg, summary, transcript):

@@ -11,8 +11,9 @@ from pathlib import Path
 import rumps
 
 from . import (audio, autostart, calendar_lookup, config, dashboard, diarize,
-               dictation_log, hotkeys, meeting_indicator, output, paste,
-               recorder, sounds, summarize, transcribe, vocab, waveform)
+               dictation_log, hotkeys, meeting_indicator, notes_pad, output,
+               paste, recorder, sounds, summarize, transcribe, vocab,
+               waveform)
 
 HELPER_NAME = "mywhisper-sysaudio"
 
@@ -81,6 +82,7 @@ class MyWhisperApp(rumps.App):
         self.waveform = waveform.Indicator(kind=config.get_visualization())
         self.meeting_panel = meeting_indicator.MeetingIndicator(
             on_stop=lambda: self._events.put(("stop_meeting",)))
+        self.notes_panel = notes_pad.NotesPad()
         self._events = queue.Queue()
         self._mic_wav = None
         self._dictation_started = 0.0
@@ -297,6 +299,8 @@ class MyWhisperApp(rumps.App):
                         log.exception("paste failed")
                 elif kind == "done":
                     self.state = "idle"
+                    self.meeting_panel.hide()
+                    self.notes_panel.hide()
                     self._sync()
         except queue.Empty:
             pass
@@ -390,6 +394,7 @@ class MyWhisperApp(rumps.App):
         self.state = "meeting"
         self._sync()
         self.meeting_panel.show()
+        self.notes_panel.show()
         if not self.sysaudio.start(_tmp_wav()):
             log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
             self._notify("System audio unavailable",
@@ -400,7 +405,15 @@ class MyWhisperApp(rumps.App):
         if self.state != "meeting":
             return
         log.info("meeting: stop requested")
-        self.meeting_panel.hide()
+        # Capture the user's typed notes BEFORE we hide the pad
+        self._meeting_notes = self.notes_panel.get_text()
+        if self._meeting_notes:
+            log.info("meeting: captured %d chars of live notes",
+                     len(self._meeting_notes))
+        self.notes_panel.hide()
+        # Switch the floating indicator to "processing" mode — it stays
+        # visible and shows live LLM progress instead of disappearing.
+        self.meeting_panel.set_processing("preparing audio…", 0)
         self.state = "processing"
         self._sync()
         threading.Thread(target=self._finish_meeting, daemon=True).start()
@@ -451,8 +464,10 @@ class MyWhisperApp(rumps.App):
 
     def _finish_meeting(self):
         mic_wav, sys_wav, mix_wav = self._mic_wav, None, None
+        summary_failed = False
         try:
             log.info("meeting: stopping recorders")
+            self._stage("Saving audio…")
             self.mic.stop()
             sys_wav = self.sysaudio.stop()
             mixed = audio.load_mono_16k(mic_wav)
@@ -467,6 +482,7 @@ class MyWhisperApp(rumps.App):
                 return
             model = self.cfg["whisper"]["model"]
             log.info("meeting: transcribing")
+            self._stage("Transcribing audio (Whisper)…")
             segments, text = transcribe.transcribe_array(
                 mixed, model, initial_prompt=vocab.prompt())
             log.info("meeting: %d transcript segments", len(segments))
@@ -475,6 +491,7 @@ class MyWhisperApp(rumps.App):
             if self.cfg["diarization"].get("enabled") and diarize.available():
                 try:
                     log.info("meeting: running speaker separation")
+                    self._stage("Separating speakers…")
                     mix_wav = _tmp_wav()
                     audio.save_16k(mix_wav, mixed)
                     turns = diarize.diarize(mix_wav)
@@ -488,27 +505,30 @@ class MyWhisperApp(rumps.App):
             provider_name = config.LLM_PROVIDERS[config.get_llm_provider()]["label"]
             model_name = config.get_llm_model(config.get_llm_provider()) or "(not set)"
 
-            # Look up a matching calendar event (Outlook, Google, Apple —
-            # whatever's synced to macOS). Soft lookup — None if no match
-            # or no permission.
             cal_event = None
             try:
+                self._stage("Checking calendar…")
                 start_ts = getattr(self, "_meeting_started_at", None)
                 cal_event = calendar_lookup.find_meeting_near(start_ts)
             except Exception:
                 log.exception("meeting: calendar lookup failed")
 
-            summary_failed = False
             title = ""
             try:
                 log.info("meeting: summarizing via LLM (provider=%s, model=%s)",
                          provider_name, model_name)
+
+                # Stage callback: streams progress to the floating indicator
+                def _on_stage(stage_text, chars):
+                    self.meeting_panel.set_processing(stage_text, chars)
+
                 title, summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
                     calendar_event=cal_event,
+                    live_notes=getattr(self, "_meeting_notes", ""),
+                    on_stage=_on_stage,
                 )
-                # Calendar title beats LLM-generated title when present.
                 if cal_event and cal_event.get("title"):
                     title = cal_event["title"]
                 if not summary_md or not summary_md.strip():
@@ -532,21 +552,34 @@ class MyWhisperApp(rumps.App):
                     "re-run with a working setup."
                 )
 
+            self._stage("Saving notes…")
             path = output.save_meeting(config.app_dir(), transcript_md,
                                        summary_md, title=title)
             log.info("meeting: saved %s", path)
             if summary_failed:
+                sounds.play_failed(self.cfg)
                 self._events.put(("notify", "Meeting saved (summary failed)",
                                   "Check the file for details."))
             else:
+                sounds.play_done(self.cfg)
                 self._events.put(("notify",
                                   title or "Meeting notes ready",
                                   path.name))
         except Exception:
             log.exception("meeting: failed")
+            sounds.play_failed(self.cfg)
             self._events.put(("notify", "Meeting failed",
                               "See ~/MyWhisper/mywhisper.log"))
         finally:
             _cleanup(mic_wav, sys_wav, mix_wav)
             self._events.put(("done",))
             log.info("meeting: cycle complete")
+
+    def _stage(self, text):
+        """Push a stage label to the floating indicator (background-thread
+        safe — set_processing only touches the view, which AppKit
+        marshals to the main thread on its own)."""
+        try:
+            self.meeting_panel.set_processing(text, 0)
+        except Exception:
+            pass
