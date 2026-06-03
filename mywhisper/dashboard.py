@@ -278,7 +278,24 @@ def _act_delete_custom_preset(body):
 
 
 def _act_request_screen_recording(body):
+    # If already granted, just refresh the UI — nothing to do.
+    if screen_recording.has_permission():
+        _push_state()
+        return
+    # Try the system prompt. macOS will silently no-op if the user has
+    # already been asked once (granted or denied), so after a short
+    # delay we check and, if still not granted, open System Settings
+    # to the right pane.
     screen_recording.request_permission()
+    import threading, time
+
+    def _followup():
+        time.sleep(1.5)
+        if not screen_recording.has_permission():
+            screen_recording.open_settings()
+        _push_state()
+
+    threading.Thread(target=_followup, daemon=True).start()
     _push_state()
 
 
