@@ -355,10 +355,11 @@ def _build_html():
         for i, m in enumerate(meetings):
             safe_content = html.escape(m["content"])
             meetings_html += f"""
-            <div class="card" onclick="toggleMeeting({i})">
-                <div class="card-header">
+            <div class="card">
+                <div class="card-header" onclick="toggleMeeting({i})">
                     <span class="card-title">{html.escape(m['name'])}</span>
                     <span class="card-file">{html.escape(m['filename'])}</span>
+                    <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
                     <span class="chevron" id="chev-{i}">&#9654;</span>
                 </div>
                 <pre class="card-body" id="meeting-{i}">{safe_content}</pre>
@@ -976,6 +977,21 @@ function toggleMeeting(i) {{
 function copyText(i, event) {{
     event.stopPropagation();
     const text = $('dict-' + i).innerText;
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    const btn = event.target;
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 1500);
+}}
+
+function copyMeeting(i, event) {{
+    event.stopPropagation();   // don't toggle the card open/closed
+    const text = $('meeting-' + i).innerText;
     const ta = document.createElement('textarea');
     ta.value = text;
     document.body.appendChild(ta);
