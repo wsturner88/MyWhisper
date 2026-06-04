@@ -1,25 +1,34 @@
 """Whisper transcription with hallucination guardrails.
 
-Whisper's default decoding settings can spiral into single-token
-repetition loops ('yeahyeahyeahyeah…', 'kukukuku…') when fed silence,
-brief noise, or very short utterances. We harden against this in three
-ways:
+Whisper has two failure modes we have to defend against:
 
-1. `condition_on_previous_text=False` — the single most effective
-   knob. Stops Whisper from being conditioned on its own prior tokens,
-   which is what allows runaway loops to form.
-2. `compression_ratio_threshold=1.8` (default is 2.4) — discards a
-   segment whose token stream compresses too well (a sign the same
-   token is repeating).
-3. `no_speech_threshold=0.65` (default 0.6) — slightly more aggressive
-   silence rejection.
-4. `temperature=(0.0, 0.2, 0.4, 0.6)` — fallback ladder. If a low
-   temperature produces a bad output, Whisper retries hotter.
+1. **Repetition loops** — fed silence or brief noise, the decoder can
+   spiral into single-token loops ('kukukuku…', 'yeahyeahyeah…'). Even
+   worse, this can happen *inside* a longer transcript where one
+   segment runs away while the others are fine.
 
-After decoding we also scan the final text for obvious repetition
-(>40% of characters are a single 4-char substring repeating) and drop
-it as a hallucination — anything that pattern-matches like that is
-not real speech.
+2. **Language drift to Japanese** — when Whisper is uncertain, its
+   multilingual decoder has a strong bias toward Japanese (especially
+   the YouTube outro 'ご視聴ありがとうございました'). On English meeting
+   audio with quiet stretches, you end up with real English mixed with
+   Japanese garbage.
+
+We address both:
+
+- `language='en'` forces English decoding. This single setting kills
+  the Japanese drift entirely — the decoder never produces Japanese
+  tokens to begin with.
+- `condition_on_previous_text=False` stops repetition loops from
+  feeding themselves token-to-token across the audio.
+- `compression_ratio_threshold=1.8` (default 2.4) rejects segments
+  whose token stream compresses too well.
+- `no_speech_threshold=0.65` (default 0.6) drops more silence early.
+- `temperature=(0.0, 0.2, 0.4, 0.6)` retries with a hotter sample if
+  the cold one looked bad.
+
+After decoding, every segment is filtered individually for repetition
+and for CJK content. Bad segments are dropped; the surviving segments
+are joined into the final transcript.
 """
 
 import logging
@@ -28,58 +37,102 @@ import threading
 
 import mlx_whisper
 
-from . import audio
+from . import audio, config
 
 log = logging.getLogger("mywhisper")
 
-# One lock so two threads never load the model concurrently.
 _lock = threading.Lock()
 
 
-def _looks_like_hallucination(text):
-    """Detect runaway repetition loops in Whisper output.
+# ---------- per-segment quality checks --------------------------------------
 
-    Catches both 'kukukuku…' (loop from the start) and
-    'ney.Michael kukukuku…' (real speech then runaway loop). Approach:
-    look at the *tail* of the text where loops typically live, and ask
-    'is some short cycle dominating this?'.
-    """
+# Unicode blocks for the languages Whisper most often hallucinates into
+# when it can't parse English audio.
+_CJK_RANGES = (
+    (0x3040, 0x309F),   # Hiragana
+    (0x30A0, 0x30FF),   # Katakana
+    (0x3400, 0x4DBF),   # CJK Extension A
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0xAC00, 0xD7AF),   # Korean Hangul Syllables
+    (0xFF66, 0xFF9F),   # Halfwidth Katakana
+)
+
+
+def _is_cjk(ch):
+    code = ord(ch)
+    for lo, hi in _CJK_RANGES:
+        if lo <= code <= hi:
+            return True
+    return False
+
+
+def _looks_like_non_english(text):
+    """Returns True if the text is dominated by CJK characters —
+    almost always means Whisper drifted into Japanese hallucinations
+    on a chunk of English meeting audio. Even 10% is suspicious; the
+    real meeting was in English."""
+    if not text:
+        return False
+    cjk = sum(1 for c in text if _is_cjk(c))
+    return cjk >= 5 and cjk / len(text) > 0.10
+
+
+def _looks_like_repetition(text):
+    """Catches both 'kukukuku…' loops and 'Jim Jim Jim Jim…' loops."""
     if not text:
         return False
     stripped = re.sub(r"\s+", "", text)
-    if len(stripped) < 40:
-        return False  # too short to tell
-
-    # Inspect the last 60% of the string — runaway loops manifest there.
-    tail = stripped[max(0, len(stripped) // 2 - 10):]
-    if len(tail) < 30:
+    if len(stripped) < 24:
         return False
-
-    # Look for any 2- to 12-char cycle that covers most of the tail.
+    # Look anywhere in the string for a 2–12-char cycle that dominates.
     for cycle in range(2, 13):
-        if len(tail) < cycle * 6:
+        if len(stripped) < cycle * 5:
             continue
-        # Try several anchor offsets so we don't depend on perfect alignment.
-        for start in range(0, min(cycle * 3, len(tail) - cycle)):
-            seed = tail[start:start + cycle]
+        for start in range(0, min(cycle * 3, len(stripped) - cycle)):
+            seed = stripped[start:start + cycle]
             if not seed.strip("."):
-                continue   # skip pure punctuation cycles
-            repeats = tail.count(seed)
-            covered = repeats * cycle
-            if covered >= len(tail) * 0.65:
+                continue
+            repeats = stripped.count(seed)
+            if repeats * cycle >= len(stripped) * 0.55:
                 return True
     return False
+
+
+def _segment_is_bad(seg_text):
+    """A segment is dropped if it looks like a hallucination."""
+    if not seg_text:
+        return True
+    if _looks_like_non_english(seg_text):
+        return "non-english"
+    if _looks_like_repetition(seg_text):
+        return "repetition"
+    return False
+
+
+# ---------- public API ------------------------------------------------------
+
+
+def _language():
+    """Read the active Whisper language from config. Defaults to 'en'."""
+    try:
+        cfg = config.load()
+        lang = (cfg.get("whisper", {}).get("language") or "en").strip()
+        return lang or "en"
+    except Exception:
+        return "en"
 
 
 def transcribe_array(data, model, initial_prompt=None):
     """Transcribe a 16kHz mono float32 numpy array.
 
-    initial_prompt biases Whisper toward custom vocabulary. Returns
-    (segments, full_text); each segment has start/end/text keys.
+    Returns (segments, full_text). initial_prompt biases Whisper toward
+    custom vocabulary. Bad segments (hallucinated Japanese, runaway
+    repetition) are filtered out before the text is built.
     """
     kwargs = {
         "path_or_hf_repo": model,
-        # Anti-hallucination guardrails — see module docstring.
+        "language": _language(),       # forces English decoder by default
+        "task": "transcribe",          # never translate
         "condition_on_previous_text": False,
         "compression_ratio_threshold": 1.8,
         "no_speech_threshold": 0.65,
@@ -87,15 +140,38 @@ def transcribe_array(data, model, initial_prompt=None):
     }
     if initial_prompt:
         kwargs["initial_prompt"] = initial_prompt
+
     with _lock:
         result = mlx_whisper.transcribe(data, **kwargs)
-    segments = result.get("segments") or []
-    text = (result.get("text") or "").strip()
-    if _looks_like_hallucination(text):
-        log.warning("transcribe: dropped probable hallucination loop: %r",
-                    text[:80])
-        return [], ""
-    return segments, text
+
+    raw_segments = result.get("segments") or []
+    good = []
+    drops = {"non-english": 0, "repetition": 0, "empty": 0}
+    for seg in raw_segments:
+        seg_text = (seg.get("text") or "").strip()
+        reason = _segment_is_bad(seg_text)
+        if reason is True:
+            drops["empty"] += 1
+            continue
+        if reason:
+            drops[reason] += 1
+            log.info("transcribe: dropped %s segment: %r",
+                     reason, seg_text[:80])
+            continue
+        good.append(seg)
+
+    total_dropped = sum(drops.values())
+    if total_dropped:
+        log.warning(
+            "transcribe: kept %d/%d segments (dropped %d non-english, "
+            "%d repetition, %d empty)",
+            len(good), len(raw_segments),
+            drops["non-english"], drops["repetition"], drops["empty"],
+        )
+
+    text = " ".join(s.get("text", "").strip() for s in good).strip()
+    text = re.sub(r"\s+", " ", text)
+    return good, text
 
 
 def transcribe_file(path, model):
@@ -103,6 +179,5 @@ def transcribe_file(path, model):
 
 
 def prewarm(model):
-    """Load the model into memory so the first real transcription is fast."""
     import numpy as np
     transcribe_array(np.zeros(16000, dtype="float32"), model)

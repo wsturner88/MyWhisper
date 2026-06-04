@@ -156,6 +156,10 @@ push_to_talk = "right_option"
 # Any MLX Whisper model on Hugging Face.
 # Balanced: large-v3-turbo. Best accuracy: large-v3. Fastest: small.
 model = "mlx-community/whisper-large-v3-turbo"
+# Force decoding into this language ('en', 'es', 'fr', etc.). Without
+# this Whisper auto-detects per chunk and frequently drifts into
+# Japanese hallucinations on quiet English audio.
+language = "en"
 
 [diarization]
 enabled = true
