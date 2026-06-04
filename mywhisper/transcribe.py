@@ -174,6 +174,56 @@ def transcribe_array(data, model, initial_prompt=None):
     return good, text
 
 
+_MIN_CHANNEL_SAMPLES = 4800  # 0.3s at 16kHz
+
+
+def transcribe_meeting(mic_data, sys_data, model, initial_prompt=None,
+                       on_stage=None):
+    """Dual-channel meeting transcription.
+
+    Transcribes the microphone ('Me') and the system-audio ('Others')
+    streams SEPARATELY, then merges the segments by timestamp. This is
+    the key fix for the garbled / hallucinated transcripts that appeared
+    once Teams system audio was mixed into the mic: each stream is now a
+    single clean source, so Whisper has far less mush to hallucinate on,
+    and we get perfect speaker separation (you vs. everyone else) for
+    free — no audio mixing, no clock-drift, no overlap.
+
+    Returns (segments, speaker_labeled):
+      - segments: list of {start, end, text, speaker} sorted by start
+      - speaker_labeled: True if we have Me/Others labels (system audio
+        was present), False for a plain mic-only run.
+    """
+    def stage(msg):
+        if on_stage:
+            try:
+                on_stage(msg)
+            except Exception:
+                pass
+
+    stage("Transcribing your microphone…")
+    mic_segs, _ = transcribe_array(mic_data, model, initial_prompt)
+    for s in mic_segs:
+        s["speaker"] = "Me"
+
+    has_sys = sys_data is not None and len(sys_data) >= _MIN_CHANNEL_SAMPLES
+    if not has_sys:
+        # Mic-only. Not speaker-labeled here — the caller may still run
+        # diarization to separate people in the room.
+        return mic_segs, False
+
+    stage("Transcribing the call audio…")
+    sys_segs, _ = transcribe_array(sys_data, model, initial_prompt)
+    for s in sys_segs:
+        s["speaker"] = "Others"
+
+    merged = sorted(mic_segs + sys_segs,
+                    key=lambda s: float(s.get("start") or 0.0))
+    log.info("transcribe_meeting: %d mic + %d call = %d merged segments",
+             len(mic_segs), len(sys_segs), len(merged))
+    return merged, True
+
+
 def transcribe_file(path, model):
     return transcribe_array(audio.load_mono_16k(path), model)
 

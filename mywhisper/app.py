@@ -486,45 +486,62 @@ class MyWhisperApp(rumps.App):
             log.info("dictation: cycle complete")
 
     def _finish_meeting(self):
-        mic_wav, sys_wav, mix_wav = self._mic_wav, None, None
+        mic_wav, sys_wav, dia_wav = self._mic_wav, None, None
         summary_failed = False
         try:
             log.info("meeting: stopping recorders")
             self._stage("Saving audio…")
             self.mic.stop()
             sys_wav = self.sysaudio.stop()
-            mixed = audio.load_mono_16k(mic_wav)
-            if sys_wav:
-                mixed = audio.mix(mixed, audio.load_mono_16k(sys_wav))
-            log.info("meeting: %.1fs of audio (system audio: %s)",
-                     len(mixed) / 16000.0, "yes" if sys_wav else "no")
-            if len(mixed) < _MIN_SAMPLES:
+
+            mic_data = audio.load_mono_16k(mic_wav)
+            sys_data = audio.load_mono_16k(sys_wav) if sys_wav else None
+            log.info("meeting: %.1fs mic / %.1fs call audio (system audio: %s)",
+                     len(mic_data) / 16000.0,
+                     (len(sys_data) / 16000.0) if sys_data is not None else 0.0,
+                     "yes" if sys_wav else "no")
+
+            mic_short = len(mic_data) < _MIN_SAMPLES
+            sys_short = sys_data is None or len(sys_data) < _MIN_SAMPLES
+            if mic_short and sys_short:
                 log.warning("meeting: audio too short, skipping")
                 self._events.put(("notify", "Meeting",
                                    "No audio captured - check microphone access."))
                 return
-            model = self.cfg["whisper"]["model"]
-            log.info("meeting: transcribing")
-            self._stage("Transcribing audio (Whisper)…")
-            segments, text = transcribe.transcribe_array(
-                mixed, model, initial_prompt=vocab.prompt())
-            log.info("meeting: %d transcript segments", len(segments))
 
-            diarized = False
-            if self.cfg["diarization"].get("enabled") and diarize.available():
+            model = self.cfg["whisper"]["model"]
+            self._stage("Transcribing audio (Whisper)…")
+            # Dual-channel: mic = "Me", system audio = "Others". The two
+            # streams are transcribed independently and merged — never
+            # mixed into one waveform (that was the source of the garbled
+            # Japanese/repeat hallucinations).
+            segments, speaker_labeled = transcribe.transcribe_meeting(
+                mic_data, sys_data, model,
+                initial_prompt=vocab.prompt(),
+                on_stage=lambda msg: self._stage(msg))
+            log.info("meeting: %d merged segments (speaker_labeled=%s)",
+                     len(segments), speaker_labeled)
+
+            # Mic-only (in-person) meeting → optionally separate the people
+            # in the room with pyannote. Skipped for remote calls, where
+            # the Me/Others channel split already gives clean separation.
+            if (not speaker_labeled
+                    and self.cfg["diarization"].get("enabled")
+                    and diarize.available()):
                 try:
-                    log.info("meeting: running speaker separation")
+                    log.info("meeting: running speaker separation (mic-only)")
                     self._stage("Separating speakers…")
-                    mix_wav = _tmp_wav()
-                    audio.save_16k(mix_wav, mixed)
-                    turns = diarize.diarize(mix_wav)
+                    dia_wav = _tmp_wav()
+                    audio.save_16k(dia_wav, mic_data)
+                    turns = diarize.diarize(dia_wav)
                     segments = diarize.label_segments(segments, turns)
-                    diarized = True
+                    speaker_labeled = True
                 except Exception:
                     log.exception("meeting: speaker separation failed")
                     self._events.put(("notify", "Speaker separation skipped", ""))
 
-            transcript_md = output.format_transcript(segments, diarized)
+            transcript_md = output.format_transcript(segments, speaker_labeled)
+            text = output.attributed_text(segments, speaker_labeled)
             provider_name = config.LLM_PROVIDERS[config.get_llm_provider()]["label"]
             model_name = config.get_llm_model(config.get_llm_provider()) or "(not set)"
 
@@ -605,7 +622,7 @@ class MyWhisperApp(rumps.App):
             self._events.put(("notify", "Meeting failed",
                               "See ~/MyWhisper/mywhisper.log"))
         finally:
-            _cleanup(mic_wav, sys_wav, mix_wav)
+            _cleanup(mic_wav, sys_wav, dia_wav)
             self._events.put(("done",))
             log.info("meeting: cycle complete")
 
