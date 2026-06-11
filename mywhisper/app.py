@@ -71,6 +71,19 @@ def _cleanup(*paths):
                 pass
 
 
+@rumps.notifications
+def _on_notification_click(info):
+    """User clicked one of our notifications. Meeting-ready notifications
+    carry the path of the saved .md file — open it."""
+    try:
+        path = info.get("open_path")
+    except Exception:
+        path = None
+    if path and os.path.exists(path):
+        subprocess.run(["open", path], check=False)
+        log.info("notification click: opened %s", path)
+
+
 def _preserve_last_dictation(path):
     """Keep the most recent dictation audio (a single file, overwritten
     every cycle) so a garbled recording can be played back afterwards to
@@ -128,6 +141,8 @@ class MyWhisperApp(rumps.App):
             self.mi_status,
             None,
             rumps.MenuItem("Dashboard…", callback=self._open_dashboard),
+            rumps.MenuItem("Open Last Meeting Notes",
+                           callback=self._open_last_meeting),
             rumps.MenuItem("Open Notes Folder", callback=self._open_folder),
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
@@ -265,9 +280,9 @@ class MyWhisperApp(rumps.App):
             self.meeting_panel.tick()
 
     # -- UI helpers ---------------------------------------------------
-    def _notify(self, title, message):
+    def _notify(self, title, message, data=None):
         try:
-            rumps.notification("MyWhisper", title, message)
+            rumps.notification("MyWhisper", title, message, data=data)
         except Exception:
             pass
 
@@ -315,7 +330,8 @@ class MyWhisperApp(rumps.App):
                 elif kind == "stop_meeting":
                     self._click_stop_meeting(None)
                 elif kind == "notify":
-                    self._notify(event[1], event[2])
+                    self._notify(event[1], event[2],
+                                 event[3] if len(event) > 3 else None)
                 elif kind == "paste":
                     try:
                         paste.paste_text(event[1])
@@ -353,6 +369,20 @@ class MyWhisperApp(rumps.App):
 
     def _open_folder(self, _):
         subprocess.run(["open", str(config.app_dir())], check=False)
+
+    def _open_last_meeting(self, _):
+        path = getattr(self, "_last_meeting_path", None)
+        if not path or not os.path.exists(path):
+            # Nothing from this session — fall back to the newest meeting
+            # file on disk.
+            existing = sorted(Path(config.app_dir()).glob("meeting_*.md"),
+                              key=lambda p: p.stat().st_mtime)
+            path = str(existing[-1]) if existing else None
+        if path and os.path.exists(path):
+            subprocess.run(["open", path], check=False)
+        else:
+            self._notify("No meetings yet",
+                         "Finished meeting notes will show up here.")
 
     def _click_dictation(self, _):
         if self.state == "idle":
@@ -628,17 +658,22 @@ class MyWhisperApp(rumps.App):
 
             self._stage("Saving notes…")
             path = output.save_meeting(config.app_dir(), transcript_md,
-                                       summary_md, title=title)
+                                       summary_md, title=title,
+                                       live_notes=getattr(
+                                           self, "_meeting_notes", ""))
             log.info("meeting: saved %s", path)
+            self._last_meeting_path = str(path)
             if summary_failed:
                 sounds.play_failed(self.cfg)
                 self._events.put(("notify", "Meeting saved (summary failed)",
-                                  "Check the file for details."))
+                                  "Click to open and see details.",
+                                  {"open_path": str(path)}))
             else:
                 sounds.play_done(self.cfg)
                 self._events.put(("notify",
                                   title or "Meeting notes ready",
-                                  path.name))
+                                  f"Click to open {path.name}",
+                                  {"open_path": str(path)}))
         except Exception:
             log.exception("meeting: failed")
             sounds.play_failed(self.cfg)

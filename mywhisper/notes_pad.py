@@ -28,7 +28,7 @@ class NotesPad:
     def _build(self):
         import objc
         from AppKit import (
-            NSColor, NSView, NSScreen, NSBackingStoreBuffered,
+            NSColor, NSView, NSScreen, NSBackingStoreBuffered, NSApplication,
             NSTextView, NSScrollView, NSFont, NSTextField, NSBezierPath,
         )
         from Foundation import NSMakeRect, NSMakeSize
@@ -47,6 +47,27 @@ class NotesPad:
 
             def canBecomeMainWindow(self):
                 return False    # never become "main" — we're a utility
+
+            def performKeyEquivalent_(self, event):
+                # Menu-bar apps have no Edit menu, so Cmd-C/V/X/A/Z
+                # never resolve through the menu system the way they do
+                # in normal apps — dispatch them to the focused view
+                # (the text view) by hand.
+                CMD, SHIFT = 1 << 20, 1 << 17
+                flags = event.modifierFlags()
+                if flags & CMD:
+                    key = (event.charactersIgnoringModifiers() or "").lower()
+                    selector = {
+                        "c": "copy:",
+                        "v": "paste:",
+                        "x": "cut:",
+                        "a": "selectAll:",
+                        "z": "redo:" if flags & SHIFT else "undo:",
+                    }.get(key)
+                    if selector and NSApplication.sharedApplication() \
+                            .sendAction_to_from_(selector, None, self):
+                        return True
+                return objc.super(_NotesPanel, self).performKeyEquivalent_(event)
 
         WIDTH, HEIGHT = 360, 220
         # Borderless + nonactivating: floats above other apps but doesn't
@@ -114,6 +135,7 @@ class NotesPad:
         text_view.setRichText_(False)
         text_view.setEditable_(True)
         text_view.setSelectable_(True)
+        text_view.setAllowsUndo_(True)   # so Cmd-Z works
         text_view.setAutomaticQuoteSubstitutionEnabled_(False)
         text_view.setAutomaticDashSubstitutionEnabled_(False)
         text_view.setAutomaticSpellingCorrectionEnabled_(False)

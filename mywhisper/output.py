@@ -67,16 +67,24 @@ def _slug(title, max_len=60):
     return s[:max_len]
 
 
-def save_meeting(out_dir, transcript_md, summary_md, title=""):
+def save_meeting(out_dir, transcript_md, summary_md, title="", live_notes=""):
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     slug = _slug(title)
     filename = f"meeting_{stamp}_{slug}.md" if slug else f"meeting_{stamp}.md"
     path = Path(out_dir) / filename
     heading = title.strip() if title else f"Meeting Notes — {stamp}"
+    # Whatever was typed into the floating notes pad is preserved
+    # verbatim, between the summary and the transcript.
+    notes_md = (live_notes or "").strip()
+    notes_section = (
+        f"---\n\n## My Notes (typed during the meeting)\n\n{notes_md}\n\n"
+        if notes_md else ""
+    )
     path.write_text(
         f"# {heading}\n"
         f"_{stamp}_\n\n"
         f"{summary_md}\n\n"
+        f"{notes_section}"
         f"---\n\n## Full Transcript\n\n{transcript_md}\n"
     )
     return path
