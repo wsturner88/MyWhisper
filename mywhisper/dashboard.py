@@ -176,6 +176,11 @@ class _BridgeHandler(NSObject):
         except Exception:
             log.exception("dashboard: callJS failed")
 
+    def refreshPanel_(self, _arg):
+        """Main-thread trampoline for refresh_if_open() — used by worker
+        threads that just saved a new meeting file."""
+        refresh_if_open()
+
     def userContentController_didReceiveScriptMessage_(self, controller, message):
         try:
             body = dict(message.body())
@@ -342,6 +347,45 @@ def _act_open_screen_recording_settings(body):
     screen_recording.open_settings()
 
 
+def _act_import_transcript(body):
+    """Summarize pasted text (Voice Memos transcript, Teams notes, …)
+    through the normal meeting pipeline and save it as a meeting file."""
+    val = body.get("value") or {}
+    text = str(val.get("text") or "").strip()
+    title_in = str(val.get("title") or "").strip()
+    preset = str(val.get("preset") or "").strip() or None
+    if not text:
+        _call_js("onImportDone", {"ok": False, "error": "No text pasted."})
+        return
+
+    def _work():
+        import time
+        from . import output, summarize
+        try:
+            _call_js("onImportStage", {"stage": "Summarizing with AI…"})
+            title, summary_md = summarize.summarize_transcript(
+                config.load(), text, preset_id=preset,
+                on_stage=lambda stage, chars=0: _call_js(
+                    "onImportStage", {"stage": str(stage)}))
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("The LLM returned an empty summary.")
+            summary_md = ("> 📥 Imported transcript — summarized from "
+                          "pasted text, not recorded by MyWhisper.\n\n"
+                          + summary_md)
+            path = output.save_meeting(config.app_dir(), text, summary_md,
+                                       title=title_in or title)
+            log.info("dashboard: imported transcript -> %s", path)
+            _call_js("onImportDone", {"ok": True, "filename": path.name})
+            time.sleep(1.2)   # let the ✓ register before the page reloads
+            _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "refreshPanel:", None, False)
+        except Exception as e:
+            log.exception("dashboard: import transcript failed")
+            _call_js("onImportDone", {"ok": False, "error": str(e)})
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
 def _act_open_meeting(body):
     """Open a meeting .md file in the default editor. Only basenames of
     real meeting files inside the data folder are accepted."""
@@ -400,6 +444,7 @@ _ACTIONS = {
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
     "open_meeting": _act_open_meeting,
+    "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
     "set_custom_url": _act_set_custom_url,
@@ -571,6 +616,47 @@ function toggleCard(i) {
         if (chev) chev.classList.add('open');
     }
 }
+
+// ----- Import-a-transcript panel ----------------------------------------
+
+function toggleImport() {
+    const p = $('import-panel');
+    const showing = p.style.display !== 'none';
+    p.style.display = showing ? 'none' : 'block';
+    if (!showing) $('import-text').focus();
+}
+
+function runImport() {
+    const text = $('import-text').value.trim();
+    const status = $('import-status');
+    if (!text) {
+        status.textContent = 'Paste some text first.';
+        return;
+    }
+    $('import-btn').disabled = true;
+    status.textContent = 'Summarizing — this can take a minute…';
+    send('import_transcript', {
+        text: text,
+        title: $('import-title').value.trim(),
+        preset: $('import-preset').value
+    });
+}
+
+window.onImportStage = function(p) {
+    $('import-status').textContent = p.stage || '';
+};
+
+window.onImportDone = function(p) {
+    $('import-btn').disabled = false;
+    const status = $('import-status');
+    if (p.ok) {
+        status.textContent = '✓ Saved — adding to your meetings…';
+        $('import-text').value = '';
+        $('import-title').value = '';
+    } else {
+        status.textContent = '✗ ' + (p.error || 'Failed — see the log.');
+    }
+};
 
 function renderMeetings() {
     const q = ($('meeting-search').value || '').trim().toLowerCase();
@@ -1113,9 +1199,39 @@ def _build_html():
 <div class="scroll-area">
 
 <div class="content active" id="meetings-content">
-    <input type="text" id="meeting-search" class="search-box"
-           placeholder="Search meetings — titles, people, anything said…"
-           oninput="renderMeetings()">
+    <div class="field-row" style="margin-bottom: 12px;">
+        <input type="text" id="meeting-search" class="search-box"
+               placeholder="Search meetings — titles, people, anything said…"
+               style="margin-bottom: 0; flex: 1;"
+               oninput="renderMeetings()">
+        <button class="btn btn-ghost" onclick="toggleImport()"
+                title="Paste a transcript from Voice Memos, Teams, etc.">+ Import</button>
+    </div>
+
+    <div class="settings-section" id="import-panel" style="display: none;">
+        <h3>Import a Transcript</h3>
+        <div class="section-desc">Paste text from your iPhone's Voice Memos,
+        a Teams transcript, or rough notes — MyWhisper summarizes it and
+        files it with your other meetings.</div>
+        <div class="field">
+            <input type="text" id="import-title"
+                   placeholder="Title (optional — the AI picks one if blank)">
+        </div>
+        <div class="field">
+            <label class="field-label">Meeting type</label>
+            <select id="import-preset"></select>
+        </div>
+        <div class="field">
+            <textarea id="import-text" style="min-height: 150px;"
+                placeholder="Paste the transcript here…"></textarea>
+        </div>
+        <div class="field-row">
+            <button class="btn" id="import-btn" onclick="runImport()">Summarize &amp; Save</button>
+            <button class="btn btn-ghost" onclick="toggleImport()">Cancel</button>
+            <span id="import-status" class="field-hint"></span>
+        </div>
+    </div>
+
     <div id="meeting-list"></div>
 </div>
 
@@ -1475,6 +1591,22 @@ function renderState(s) {{
         cu.appendChild(empty);
     }} else {{
         s.custom_presets.forEach(p => renderPresetRow(cu, p, s.meeting_preset, true));
+    }}
+
+    // Import-panel meeting-type dropdown (built-in + custom presets)
+    const isel = $('import-preset');
+    if (isel) {{
+        const prev = isel.value;
+        isel.innerHTML = '';
+        const addOpt = (p) => {{
+            const o = document.createElement('option');
+            o.value = p.id;
+            o.textContent = p.label;
+            if (p.id === (prev || s.meeting_preset)) o.selected = true;
+            isel.appendChild(o);
+        }};
+        s.builtin_presets.forEach(addOpt);
+        (s.custom_presets || []).forEach(addOpt);
     }}
 
     // Starter quick-add buttons

@@ -71,6 +71,34 @@ def _cleanup(*paths):
                 pass
 
 
+def _install_edit_menu():
+    """Cmd-C/V/X/A/Z resolve through the app's main menu. A menu-bar app
+    has no Edit menu, so keyboard paste silently fails in every window
+    (dashboard text boxes, import panel). The menu is never visible
+    (LSUIElement app) but still routes the shortcuts to whichever text
+    field has focus."""
+    from AppKit import NSApp, NSMenu, NSMenuItem
+    main = NSApp.mainMenu()
+    if main is None:
+        main = NSMenu.alloc().init()
+        NSApp.setMainMenu_(main)
+    edit = NSMenu.alloc().initWithTitle_("Edit")
+    for title, sel, key in (
+            ("Undo", "undo:", "z"),
+            ("Redo", "redo:", "Z"),       # uppercase = Cmd-Shift-Z
+            ("Cut", "cut:", "x"),
+            ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"),
+            ("Select All", "selectAll:", "a")):
+        edit.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, sel, key))
+    holder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Edit", None, "")
+    holder.setSubmenu_(edit)
+    main.addItem_(holder)
+
+
 @rumps.notifications
 def _on_notification_click(info):
     """User clicked one of our notifications. Meeting-ready notifications
@@ -163,6 +191,11 @@ class MyWhisperApp(rumps.App):
         rumps.Timer(self._poll, 0.2).start()
         rumps.Timer(self._tick_waveform, 0.04).start()
         threading.Thread(target=self._prewarm, daemon=True).start()
+
+        try:
+            _install_edit_menu()
+        except Exception:
+            log.exception("edit menu install failed")
 
         # Ask for Calendar access once. If user has never been prompted,
         # this shows the system dialog. If already decided, this is a
