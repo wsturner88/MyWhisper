@@ -41,13 +41,41 @@ def load_terms():
     return []
 
 
+def _term_only(line):
+    """Strip annotations: 'Marty Cohen - StewartEFI - Sales Manager' ->
+    'Marty Cohen'. The annotations (roles, 'heard as' mishearings) must
+    never reach Whisper — they bias it toward the wrong words."""
+    for sep in (" - ", " — ", " – "):
+        if sep in line:
+            line = line.split(sep)[0]
+    return line.strip()
+
+
 def prompt():
-    """Return a Whisper initial_prompt biasing toward the custom terms."""
-    terms = load_terms()
+    """Return a Whisper initial_prompt biasing toward the custom terms.
+
+    A bare comma-joined name list makes Whisper's decoder occasionally
+    *continue the list* instead of transcribing the audio (looping
+    'Michael Cohen, Michael Cohen, …'), so the terms are wrapped in a
+    sentence and kept short. transcribe_array() retries without the
+    prompt if the result still comes back as hallucinated junk.
+    """
+    terms = []
+    for line in load_terms():
+        if line.endswith(":"):  # section header, not a term
+            continue
+        term = _term_only(line)
+        if term and term not in terms:
+            terms.append(term)
     if not terms:
         return None
-    # Whisper's prompt budget is small; cap it (most-recent terms win).
-    text = ", ".join(terms)
-    if len(text) > 800:
-        text = ", ".join(terms[-120:])[:800]
-    return text
+    # Whisper's prompt budget is small (224 tokens, oldest cut first);
+    # stay well under it so every term keeps its influence.
+    kept = []
+    used = 0
+    for term in terms:
+        used += len(term) + 2
+        if used > 600:
+            break
+        kept.append(term)
+    return "Notes may mention: " + ", ".join(kept) + "."

@@ -1,6 +1,7 @@
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -68,6 +69,17 @@ def _cleanup(*paths):
                 os.remove(path)
             except OSError:
                 pass
+
+
+def _preserve_last_dictation(path):
+    """Keep the most recent dictation audio (a single file, overwritten
+    every cycle) so a garbled recording can be played back afterwards to
+    tell a mic problem from a transcription problem."""
+    try:
+        if path and os.path.exists(path):
+            shutil.move(path, str(config.app_dir() / "last_dictation.wav"))
+    except Exception:
+        _cleanup(path)
 
 
 class MyWhisperApp(rumps.App):
@@ -474,14 +486,25 @@ class MyWhisperApp(rumps.App):
                 self._events.put(("paste", text))
                 log.info("dictation: queued paste of %d characters", len(text))
             else:
-                self._events.put(("notify", "Dictation", "No speech detected."))
+                drops = transcribe.last_drops
+                if drops.get("non-english") or drops.get("repetition"):
+                    # Whisper produced output but it was hallucinated junk —
+                    # the audio reached us garbled. Very different problem
+                    # from silence, so say so.
+                    self._events.put(("notify", "Dictation",
+                                      "Audio came through garbled — kept a "
+                                      "copy as last_dictation.wav (menu → "
+                                      "Open Notes Folder)."))
+                else:
+                    self._events.put(("notify", "Dictation",
+                                      "No speech detected."))
                 log.info("dictation: empty transcript")
         except Exception:
             log.exception("dictation: failed")
             self._events.put(("notify", "Dictation failed",
                               "See ~/MyWhisper/mywhisper.log"))
         finally:
-            _cleanup(mic_wav)
+            _preserve_last_dictation(mic_wav)
             self._events.put(("done",))
             log.info("dictation: cycle complete")
 

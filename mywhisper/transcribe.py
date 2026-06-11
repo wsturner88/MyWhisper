@@ -43,6 +43,11 @@ log = logging.getLogger("mywhisper")
 
 _lock = threading.Lock()
 
+# Drop counts from the most recent transcribe_array() call. Lets the app
+# distinguish "audio was garbled and filtered out" from "true silence"
+# when the final transcript comes back empty.
+last_drops = {"non-english": 0, "repetition": 0, "empty": 0}
+
 
 # ---------- per-segment quality checks --------------------------------------
 
@@ -146,7 +151,8 @@ def transcribe_array(data, model, initial_prompt=None):
 
     raw_segments = result.get("segments") or []
     good = []
-    drops = {"non-english": 0, "repetition": 0, "empty": 0}
+    global last_drops
+    drops = last_drops = {"non-english": 0, "repetition": 0, "empty": 0}
     for seg in raw_segments:
         seg_text = (seg.get("text") or "").strip()
         reason = _segment_is_bad(seg_text)
@@ -168,6 +174,15 @@ def transcribe_array(data, model, initial_prompt=None):
             len(good), len(raw_segments),
             drops["non-english"], drops["repetition"], drops["empty"],
         )
+
+    # The vocabulary prompt itself can send the decoder into a name loop
+    # ('Michael Cohen, Michael Cohen, …') on perfectly good audio. If the
+    # prompt was set and EVERYTHING it produced was hallucinated junk,
+    # the audio is almost certainly fine — try once more without it.
+    if initial_prompt and raw_segments and not good:
+        log.warning("transcribe: all segments dropped — retrying without "
+                    "vocabulary prompt")
+        return transcribe_array(data, model, initial_prompt=None)
 
     text = " ".join(s.get("text", "").strip() for s in good).strip()
     text = re.sub(r"\s+", " ", text)

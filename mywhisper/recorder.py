@@ -1,3 +1,4 @@
+import logging
 import os
 import signal
 import subprocess
@@ -6,6 +7,8 @@ import threading
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+log = logging.getLogger("mywhisper")
 
 
 def input_devices(refresh=False):
@@ -65,6 +68,13 @@ class MicRecorder:
             samplerate=self.samplerate, channels=1, dtype="float32",
             device=self.device, callback=self._callback)
         self._stream.start()
+        # Log the device PortAudio actually opened — if recordings come
+        # back garbled, this tells us whether the wrong mic was captured.
+        try:
+            opened = sd.query_devices(self._stream.device)["name"]
+        except Exception:
+            opened = self.device or "system default"
+        log.info("mic recording: device=%r rate=%dHz", opened, self.samplerate)
 
     def stop(self):
         self.level = 0.0
