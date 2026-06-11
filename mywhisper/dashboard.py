@@ -8,6 +8,9 @@ import html
 import json
 import logging
 import os
+import re
+import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -66,13 +69,29 @@ def _meeting_files():
         return []
     files = sorted(out_dir.glob("meeting_*.md"), reverse=True)
     meetings = []
+    this_year = datetime.now().year
     for f in files[:50]:
         try:
             raw = f.read_text()
-            name = f.stem.replace("meeting_", "").replace("_", " @ ")
-            meetings.append({"name": name, "filename": f.name, "content": raw})
         except Exception:
-            pass
+            continue
+        # Filenames look like meeting_2026-06-10_1636_SEFI_-_ZF_Catchup.md
+        # — show the subject first and a friendly date/time underneath.
+        title, when = f.stem, ""
+        m = re.match(r"meeting_(\d{4}-\d{2}-\d{2})_(\d{4})(?:_(.+))?$", f.stem)
+        if m:
+            date_s, time_s, slug = m.group(1), m.group(2), m.group(3) or ""
+            title = slug.replace("_", " ").strip() or "Meeting (no title)"
+            try:
+                dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H%M")
+                day = dt.strftime("%a %b %-d")
+                if dt.year != this_year:
+                    day += f", {dt.year}"
+                when = day + dt.strftime(" · %-I:%M %p")
+            except ValueError:
+                when = date_s
+        meetings.append({"title": title, "when": when,
+                         "filename": f.name, "content": raw})
     return meetings
 
 
@@ -148,6 +167,15 @@ def _save_vocab_text(text):
 class _BridgeHandler(NSObject):
     """Receives postMessage() calls from the dashboard HTML."""
 
+    def callJS_(self, js):
+        """Runs on the main thread (via performSelectorOnMainThread) —
+        WebKit requires evaluateJavaScript to be called there."""
+        try:
+            if _webview is not None:
+                _webview.evaluateJavaScript_completionHandler_(str(js), None)
+        except Exception:
+            log.exception("dashboard: callJS failed")
+
     def userContentController_didReceiveScriptMessage_(self, controller, message):
         try:
             body = dict(message.body())
@@ -193,27 +221,38 @@ def _act_set_custom_url(body):
 
 
 def _act_test_llm(body):
-    from . import llm
-    ok, msg = llm.test_connection()
-    _call_js("onTestResult", {"ok": bool(ok), "message": str(msg)})
+    # Network call with a long timeout — run it off the main thread so a
+    # slow provider can't freeze the menu bar and push-to-talk.
+    def _work():
+        from . import llm
+        try:
+            ok, msg = llm.test_connection()
+        except Exception as e:
+            ok, msg = False, str(e)
+        _call_js("onTestResult", {"ok": bool(ok), "message": str(msg)})
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _act_fetch_models(body):
-    from . import llm
-    try:
-        models = llm.list_models()
-        _call_js("onModelsLoaded", {
-            "ok": True,
-            "models": models,
-            "provider": config.get_llm_provider(),
-        })
-    except Exception as e:
-        log.exception("dashboard: fetch_models failed")
-        _call_js("onModelsLoaded", {
-            "ok": False,
-            "error": str(e),
-            "provider": config.get_llm_provider(),
-        })
+    def _work():
+        from . import llm
+        try:
+            models = llm.list_models()
+            _call_js("onModelsLoaded", {
+                "ok": True,
+                "models": models,
+                "provider": config.get_llm_provider(),
+            })
+        except Exception as e:
+            log.exception("dashboard: fetch_models failed")
+            _call_js("onModelsLoaded", {
+                "ok": False,
+                "error": str(e),
+                "provider": config.get_llm_provider(),
+            })
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _act_set_mic(body):
@@ -303,6 +342,15 @@ def _act_open_screen_recording_settings(body):
     screen_recording.open_settings()
 
 
+def _act_open_meeting(body):
+    """Open a meeting .md file in the default editor. Only basenames of
+    real meeting files inside the data folder are accepted."""
+    name = os.path.basename(str(body.get("value") or ""))
+    path = config.app_dir() / name
+    if name.startswith("meeting_") and name.endswith(".md") and path.exists():
+        subprocess.run(["open", str(path)], check=False)
+
+
 def _act_close_panel(body):
     try:
         if _panel is not None:
@@ -351,6 +399,7 @@ _ACTIONS = {
     "update_custom_preset": _act_update_custom_preset,
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
+    "open_meeting": _act_open_meeting,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
     "set_custom_url": _act_set_custom_url,
@@ -360,10 +409,15 @@ _ACTIONS = {
 
 
 def _call_js(fn_name, payload):
-    if _webview is None:
+    if _webview is None or _bridge is None:
         return
     js = f"window.{fn_name} && window.{fn_name}({json.dumps(payload)});"
-    _webview.evaluateJavaScript_completionHandler_(js, None)
+    from Foundation import NSThread
+    if NSThread.isMainThread():
+        _webview.evaluateJavaScript_completionHandler_(js, None)
+    else:
+        _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "callJS:", js, False)
 
 
 def _push_state():
@@ -372,33 +426,229 @@ def _push_state():
 
 # -- HTML / CSS / JS for the dashboard --------------------------------------
 
+# Plain strings (NOT f-strings) so CSS/JS braces don't need doubling.
+
+_EXTRA_CSS = """
+    .search-box {
+        width: 100%;
+        background: var(--surface);
+        border: 1px solid #444;
+        color: var(--text);
+        padding: 9px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+        margin-bottom: 12px;
+        outline: none;
+    }
+    .search-box:focus { border-color: var(--accent); }
+    .card-title-block { flex: 1; min-width: 0; cursor: pointer; }
+    .card-title2 {
+        font-weight: 600;
+        font-size: 13px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .card-when { color: var(--text3); font-size: 11px; margin-top: 2px; }
+    .md-content {
+        padding: 4px 16px 16px;
+        font-size: 12.5px;
+        line-height: 1.65;
+        color: var(--text2);
+        -webkit-user-select: text;
+        user-select: text;
+    }
+    .md-content h2 { font-size: 14px; color: var(--text); margin: 14px 0 6px; }
+    .md-content h3 { font-size: 13px; color: var(--text); margin: 12px 0 5px; }
+    .md-content h4 { font-size: 12px; color: var(--text); margin: 10px 0 4px; }
+    .md-content p { margin: 6px 0; }
+    .md-content ul { margin: 6px 0 6px 18px; }
+    .md-content li { margin: 3px 0; }
+    .md-content hr { border: none; border-top: 1px solid #3a3a5a; margin: 12px 0; }
+    .md-content blockquote {
+        border-left: 3px solid var(--accent);
+        padding-left: 10px;
+        margin: 8px 0;
+    }
+    .md-content b { color: var(--text); }
+    .md-content code {
+        background: var(--bg);
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 11px;
+    }
+"""
+
+_MEETINGS_JS = """
+// ----- Meetings tab: rendered from the MEETINGS data, with search -------
+
+const _openMeetings = new Set();
+
+function mdToHtml(md) {
+    // Tiny markdown renderer for the formats save_meeting produces:
+    // headings, bold, bullets, blockquotes, --- rules, paragraphs.
+    const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                      .replace(/>/g, '&gt;');
+    const inline = s => s
+        .replace(/\\*\\*(.+?)\\*\\*/g, '<b>$1</b>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>');
+    const out = [];
+    let para = [], inList = false;
+    const flushPara = () => {
+        if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; }
+    };
+    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+    for (const raw of md.split('\\n')) {
+        let t = inline(esc(raw)).trim();
+        if (!t) { flushPara(); closeList(); continue; }
+        if (/^---+$/.test(t)) { flushPara(); closeList(); out.push('<hr>'); continue; }
+        let m;
+        if ((m = t.match(/^(#{1,4})\\s+(.*)$/))) {
+            flushPara(); closeList();
+            const lvl = Math.min(m[1].length + 1, 4);
+            out.push('<h' + lvl + '>' + m[2] + '</h' + lvl + '>');
+            continue;
+        }
+        if ((m = t.match(/^[-*\\u2022]\\s+(.*)$/))) {
+            flushPara();
+            if (!inList) { out.push('<ul>'); inList = true; }
+            out.push('<li>' + m[1] + '</li>');
+            continue;
+        }
+        if ((m = t.match(/^&gt;\\s?(.*)$/))) {
+            flushPara(); closeList();
+            out.push('<blockquote>' + m[1] + '</blockquote>');
+            continue;
+        }
+        if (/^_.+_$/.test(t)) t = '<i>' + t.slice(1, -1) + '</i>';
+        para.push(t);
+    }
+    flushPara(); closeList();
+    return out.join('\\n');
+}
+
+function copyToClipboard(text, event) {
+    if (event) event.stopPropagation();
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (event && event.target && event.target.classList) {
+        const btn = event.target;
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+            btn.textContent = orig;
+            btn.classList.remove('copied');
+        }, 1500);
+    }
+}
+
+function meetingBodyHtml(i) {
+    return '<div class="card-body-toolbar">' +
+        '<button class="copy-btn" onclick="copyMeetingIdx(' + i + ', event)">Copy</button>' +
+        '<button class="close-btn-inline" onclick="toggleCard(' + i + ')">&times; Close</button>' +
+        '</div><div class="md-content">' + mdToHtml(MEETINGS[i].content) + '</div>';
+}
+
+function copyMeetingIdx(i, event) { copyToClipboard(MEETINGS[i].content, event); }
+
+function toggleCard(i) {
+    const body = $('meeting-' + i);
+    const chev = $('chev-' + i);
+    if (!body) return;
+    if (body.classList.contains('open')) {
+        _openMeetings.delete(i);
+        body.classList.remove('open');
+        if (chev) chev.classList.remove('open');
+    } else {
+        _openMeetings.add(i);
+        if (!body.innerHTML) body.innerHTML = meetingBodyHtml(i);
+        body.classList.add('open');
+        if (chev) chev.classList.add('open');
+    }
+}
+
+function renderMeetings() {
+    const q = ($('meeting-search').value || '').trim().toLowerCase();
+    const list = $('meeting-list');
+    list.innerHTML = '';
+    let shown = 0;
+    MEETINGS.forEach((m, i) => {
+        if (q && !((m.title + ' ' + m.when + ' ' + m.content)
+                .toLowerCase().includes(q))) return;
+        shown++;
+
+        const card = document.createElement('div');
+        card.className = 'card';
+
+        const header = document.createElement('div');
+        header.className = 'card-header';
+
+        const tblock = document.createElement('div');
+        tblock.className = 'card-title-block';
+        const t1 = document.createElement('div');
+        t1.className = 'card-title2';
+        t1.textContent = m.title;
+        const t2 = document.createElement('div');
+        t2.className = 'card-when';
+        t2.textContent = m.when;
+        tblock.appendChild(t1);
+        tblock.appendChild(t2);
+        tblock.onclick = () => toggleCard(i);
+
+        const openBtn = document.createElement('button');
+        openBtn.className = 'copy-btn';
+        openBtn.textContent = 'Open';
+        openBtn.title = 'Open the file';
+        openBtn.onclick = (e) => { e.stopPropagation(); send('open_meeting', m.filename); };
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'copy-btn';
+        copyBtn.textContent = 'Copy';
+        copyBtn.onclick = (e) => copyToClipboard(m.content, e);
+
+        const chev = document.createElement('span');
+        chev.className = 'chevron' + (_openMeetings.has(i) ? ' open' : '');
+        chev.id = 'chev-' + i;
+        chev.innerHTML = '&#9654;';
+        chev.onclick = () => toggleCard(i);
+
+        header.appendChild(tblock);
+        header.appendChild(openBtn);
+        header.appendChild(copyBtn);
+        header.appendChild(chev);
+
+        const body = document.createElement('div');
+        body.className = 'card-body' + (_openMeetings.has(i) ? ' open' : '');
+        body.id = 'meeting-' + i;
+        if (_openMeetings.has(i)) body.innerHTML = meetingBodyHtml(i);
+
+        card.appendChild(header);
+        card.appendChild(body);
+        list.appendChild(card);
+    });
+    if (!shown) {
+        list.innerHTML = '<p class="empty">' + (MEETINGS.length
+            ? 'No meetings match your search.'
+            : 'No meetings recorded yet.') + '</p>';
+    }
+}
+"""
+
+
 def _build_html():
     meetings = _meeting_files()
     dictations = dictation_log.recent()
     state = _state_snapshot()
 
-    meetings_html = ""
-    if not meetings:
-        meetings_html = '<p class="empty">No meetings recorded yet.</p>'
-    else:
-        for i, m in enumerate(meetings):
-            safe_content = html.escape(m["content"])
-            meetings_html += f"""
-            <div class="card">
-                <div class="card-header" onclick="toggleMeeting({i})">
-                    <span class="card-title">{html.escape(m['name'])}</span>
-                    <span class="card-file">{html.escape(m['filename'])}</span>
-                    <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
-                    <span class="chevron" id="chev-{i}">&#9654;</span>
-                </div>
-                <div class="card-body" id="meeting-{i}">
-                    <div class="card-body-toolbar">
-                        <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
-                        <button class="close-btn-inline" onclick="toggleMeeting({i}); event.stopPropagation();">&times; Close</button>
-                    </div>
-                    <pre class="card-body-content">{safe_content}</pre>
-                </div>
-            </div>"""
+    # The meetings list is rendered client-side (search + lazy expansion).
+    # "</" must be escaped or a literal "</script>" inside a transcript
+    # would terminate the script block.
+    meetings_json = json.dumps(meetings).replace("</", "<\\/")
 
     dictations_html = ""
     if not dictations:
@@ -416,7 +666,7 @@ def _build_html():
             </div>"""
 
     now = datetime.now().strftime("%I:%M %p")
-    state_json = json.dumps(state)
+    state_json = json.dumps(state).replace("</", "<\\/")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -837,6 +1087,7 @@ def _build_html():
         border-color: var(--accent);
         color: var(--text);
     }}
+{_EXTRA_CSS}
 </style>
 </head>
 <body>
@@ -862,7 +1113,10 @@ def _build_html():
 <div class="scroll-area">
 
 <div class="content active" id="meetings-content">
-    {meetings_html}
+    <input type="text" id="meeting-search" class="search-box"
+           placeholder="Search meetings — titles, people, anything said…"
+           oninput="renderMeetings()">
+    <div id="meeting-list"></div>
 </div>
 
 <div class="content" id="dictation-content">
@@ -1036,6 +1290,7 @@ def _build_html():
 
 <script>
 const initialState = {state_json};
+const MEETINGS = {meetings_json};
 
 function $(id) {{ return document.getElementById(id); }}
 
@@ -1054,40 +1309,11 @@ function switchTab(name) {{
     }});
 }}
 
-function toggleMeeting(i) {{
-    $('meeting-' + i).classList.toggle('open');
-    $('chev-' + i).classList.toggle('open');
-}}
-
 function copyText(i, event) {{
-    event.stopPropagation();
-    const text = $('dict-' + i).innerText;
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    const btn = event.target;
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 1500);
+    copyToClipboard($('dict-' + i).innerText, event);
 }}
 
-function copyMeeting(i, event) {{
-    event.stopPropagation();   // don't toggle the card open/closed
-    const text = $('meeting-' + i).innerText;
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    const btn = event.target;
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 1500);
-}}
+{_MEETINGS_JS}
 
 function saveApiKey() {{
     const v = $('api-key-input').value.trim();
@@ -1286,10 +1512,19 @@ function renderPresetRow(container, preset, selectedId, editable) {{
         const delBtn = document.createElement('button');
         delBtn.className = 'icon-btn delete';
         delBtn.textContent = 'Delete';
+        // No confirm() here — WKWebView suppresses JS dialogs, so it
+        // would silently answer "no". Two-click confirm instead.
         delBtn.onclick = (e) => {{
             e.stopPropagation();
-            if (confirm('Delete preset "' + preset.label + '"?')) {{
+            if (delBtn.dataset.armed) {{
                 send('delete_custom_preset', {{ id: preset.id }});
+            }} else {{
+                delBtn.dataset.armed = '1';
+                delBtn.textContent = 'Click again to delete';
+                setTimeout(() => {{
+                    delBtn.dataset.armed = '';
+                    delBtn.textContent = 'Delete';
+                }}, 2500);
             }}
         }};
         actions.appendChild(editBtn);
@@ -1427,6 +1662,7 @@ function onModelPicked() {{
 }}
 
 renderState(initialState);
+renderMeetings();
 
 // Fetch models in the background on first open. Also refetch whenever
 // the provider dropdown changes (provider is in the state pushed back
@@ -1504,6 +1740,17 @@ def _create_panel():
 def _load_content():
     html_str = _build_html()
     _webview.loadHTMLString_baseURL_(html_str, None)
+
+
+def refresh_if_open():
+    """Reload the dashboard content if the panel is currently showing —
+    called after a meeting finishes so the new file appears right away."""
+    try:
+        if _panel is not None and _panel.isVisible():
+            _load_content()
+            log.info("dashboard: refreshed after meeting")
+    except Exception:
+        log.exception("dashboard: refresh failed")
 
 
 def open_dashboard():

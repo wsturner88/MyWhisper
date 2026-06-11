@@ -338,6 +338,8 @@ class MyWhisperApp(rumps.App):
                         log.info("dictation: pasted %d characters", len(event[1]))
                     except Exception:
                         log.exception("paste failed")
+                elif kind == "refresh_dashboard":
+                    dashboard.refresh_if_open()
                 elif kind == "done":
                     self.state = "idle"
                     self.meeting_panel.hide()
@@ -674,6 +676,7 @@ class MyWhisperApp(rumps.App):
                                   title or "Meeting notes ready",
                                   f"Click to open {path.name}",
                                   {"open_path": str(path)}))
+            self._events.put(("refresh_dashboard",))
         except Exception:
             log.exception("meeting: failed")
             sounds.play_failed(self.cfg)
