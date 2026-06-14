@@ -88,3 +88,75 @@ def save_meeting(out_dir, transcript_md, summary_md, title="", live_notes=""):
         f"---\n\n## Full Transcript\n\n{transcript_md}\n"
     )
     return path
+
+
+_TRANSCRIPT_HDR = "## Full Transcript"
+_NOTES_HDR = "## My Notes (typed during the meeting)"
+
+
+def parse_meeting(path):
+    """Split a saved meeting file back into its parts so the summary can
+    be regenerated from the transcript. Returns a dict with title, stamp,
+    summary_md, notes_md, transcript_md (any of which may be '')."""
+    raw = Path(path).read_text()
+
+    title = ""
+    m = re.search(r"^# (.+)$", raw, re.M)
+    if m:
+        title = m.group(1).strip()
+
+    stamp = ""
+    m = re.search(r"^_(.+)_\s*$", raw, re.M)   # the italic date line
+    if m:
+        stamp = m.group(1).strip()
+
+    # Transcript: everything after the (last) Full Transcript header.
+    transcript = ""
+    ti = raw.rfind(_TRANSCRIPT_HDR)
+    if ti != -1:
+        transcript = raw[ti + len(_TRANSCRIPT_HDR):].strip()
+
+    # Notes: between the notes header and the following '---' rule.
+    notes = ""
+    ni = raw.find(_NOTES_HDR)
+    if ni != -1:
+        nstart = ni + len(_NOTES_HDR)
+        nend = raw.find("\n---", nstart)
+        notes = raw[nstart:(nend if nend != -1 else len(raw))].strip()
+
+    # Summary: between the stamp line and the first '---' rule. Only used
+    # to preserve any leading banner; a stray '---' in the body is
+    # harmless because the banner sits at the very top.
+    summary = ""
+    if stamp:
+        si = raw.find(f"_{stamp}_")
+        if si != -1:
+            sstart = si + len(stamp) + 2
+            send = raw.find("\n---", sstart)
+            summary = raw[sstart:(send if send != -1 else len(raw))].strip()
+
+    return {"title": title, "stamp": stamp, "summary_md": summary,
+            "notes_md": notes, "transcript_md": transcript}
+
+
+def rewrite_meeting(path, title, stamp, summary_md, notes_md, transcript_md):
+    """Rewrite a meeting file in place with a new summary, keeping the
+    same filename, title, date, notes, and transcript."""
+    notes_section = (
+        f"---\n\n{_NOTES_HDR}\n\n{notes_md}\n\n" if notes_md else ""
+    )
+    heading = title.strip() if title else f"Meeting Notes — {stamp}"
+    Path(path).write_text(
+        f"# {heading}\n"
+        f"_{stamp}_\n\n"
+        f"{summary_md}\n\n"
+        f"{notes_section}"
+        f"---\n\n{_TRANSCRIPT_HDR}\n\n{transcript_md}\n"
+    )
+    return Path(path)
+
+
+def transcript_to_attributed(transcript_md):
+    """Convert a stored markdown transcript ('**Me:** …') back to the
+    plain attributed form the summarizer expects ('Me: …')."""
+    return re.sub(r"\*\*(.+?):\*\*", r"\1:", transcript_md or "").strip()

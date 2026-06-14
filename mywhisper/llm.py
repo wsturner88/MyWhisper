@@ -400,6 +400,11 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
                         {"role": "user", "content": user},
                     ],
                     "stream": False,
+                    # Skip the chain-of-thought trace on "thinking" models
+                    # (e.g. gemma3/4 reasoning variants). Without this they
+                    # spend minutes reasoning before writing a word and time
+                    # out on long transcripts. Ignored by non-thinking models.
+                    "think": False,
                     "options": {"num_predict": max_tokens},
                 },
                 timeout=600,
@@ -416,6 +421,7 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
                     {"role": "user", "content": user},
                 ],
                 "stream": True,
+                "think": False,   # see note above
                 "options": {"num_predict": max_tokens},
             },
             stream=True,

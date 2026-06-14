@@ -386,6 +386,66 @@ def _act_import_transcript(body):
     threading.Thread(target=_work, daemon=True).start()
 
 
+def _act_resummarize_meeting(body):
+    """Re-run the AI summary for an existing meeting from its saved
+    transcript — no re-recording. Useful after switching to a better
+    model or when a summary came out weak."""
+    name = os.path.basename(str(body.get("value") or ""))
+    path = config.app_dir() / name
+    if not (name.startswith("meeting_") and name.endswith(".md")
+            and path.exists()):
+        _call_js("onResummarizeDone",
+                 {"ok": False, "filename": name, "error": "File not found."})
+        return
+
+    def _work():
+        from . import output, summarize
+        try:
+            parts = output.parse_meeting(path)
+            transcript = parts["transcript_md"].strip()
+            if not transcript or transcript == "_(no speech detected)_":
+                raise RuntimeError("This meeting has no transcript to "
+                                   "summarize.")
+            llm_input = output.transcript_to_attributed(transcript)
+
+            _call_js("onResummarizeStage",
+                     {"filename": name, "stage": "Re-summarizing…"})
+            _new_title, summary_md = summarize.summarize_transcript(
+                config.load(), llm_input,
+                live_notes=parts["notes_md"],
+                on_stage=lambda stage, chars=0: _call_js(
+                    "onResummarizeStage",
+                    {"filename": name, "stage": str(stage)}))
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("The LLM returned an empty summary.")
+
+            # Preserve any leading banner (e.g. 'mic-only' or 'imported')
+            # from the previous summary so that context isn't lost.
+            banner_lines = []
+            for line in parts["summary_md"].split("\n"):
+                if line.startswith(">"):
+                    banner_lines.append(line)
+                else:
+                    break
+            banner = "\n".join(banner_lines).strip()
+            if banner:
+                summary_md = f"{banner}\n\n{summary_md}"
+
+            output.rewrite_meeting(
+                path, parts["title"], parts["stamp"], summary_md,
+                parts["notes_md"], transcript)
+            log.info("dashboard: re-summarized %s", name)
+            _call_js("onResummarizeDone",
+                     {"ok": True, "filename": name,
+                      "content": path.read_text()})
+        except Exception as e:
+            log.exception("dashboard: resummarize failed")
+            _call_js("onResummarizeDone",
+                     {"ok": False, "filename": name, "error": str(e)})
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
 def _act_open_meeting(body):
     """Open a meeting .md file in the default editor. Only basenames of
     real meeting files inside the data folder are accepted."""
@@ -444,6 +504,7 @@ _ACTIONS = {
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
     "open_meeting": _act_open_meeting,
+    "resummarize_meeting": _act_resummarize_meeting,
     "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
@@ -658,6 +719,41 @@ window.onImportDone = function(p) {
     }
 };
 
+// ----- Re-summarize an existing meeting ---------------------------------
+
+function _resetRedoButtons() {
+    document.querySelectorAll('.redo-btn').forEach(b => {
+        b.disabled = false;
+        b.dataset.armed = '';
+        b.textContent = 'Redo';
+    });
+}
+
+window.onResummarizeStage = function(p) {
+    $('meeting-action-status').textContent = '↻ ' + (p.stage || 'Working…');
+};
+
+window.onResummarizeDone = function(p) {
+    const s = $('meeting-action-status');
+    _resetRedoButtons();
+    if (p.ok) {
+        // Patch the in-memory copy and re-render the card if it's open —
+        // no full reload, so search and scroll position are preserved.
+        const idx = MEETINGS.findIndex(m => m.filename === p.filename);
+        if (idx !== -1) {
+            MEETINGS[idx].content = p.content;
+            const body = $('meeting-' + idx);
+            if (body && body.classList.contains('open')) {
+                body.innerHTML = meetingBodyHtml(idx);
+            }
+        }
+        s.textContent = '✓ Summary updated for ' + p.filename;
+        setTimeout(() => { s.textContent = ''; }, 5000);
+    } else {
+        s.textContent = '✗ ' + (p.error || 'Re-summarize failed.');
+    }
+};
+
 function renderMeetings() {
     const q = ($('meeting-search').value || '').trim().toLowerCase();
     const list = $('meeting-list');
@@ -692,6 +788,32 @@ function renderMeetings() {
         openBtn.title = 'Open the file';
         openBtn.onclick = (e) => { e.stopPropagation(); send('open_meeting', m.filename); };
 
+        // Redo Summary — re-runs the AI on the saved transcript. Two-click
+        // arm because it overwrites the current summary (WKWebView blocks
+        // confirm() dialogs, so we can't ask the normal way).
+        const redoBtn = document.createElement('button');
+        redoBtn.className = 'copy-btn redo-btn';
+        redoBtn.textContent = 'Redo';
+        redoBtn.title = 'Re-run the AI summary from the transcript';
+        redoBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (redoBtn.dataset.armed) {
+                redoBtn.dataset.armed = '';
+                redoBtn.textContent = '…';
+                redoBtn.disabled = true;
+                send('resummarize_meeting', m.filename);
+            } else {
+                redoBtn.dataset.armed = '1';
+                redoBtn.textContent = 'Redo?';
+                setTimeout(() => {
+                    if (redoBtn.dataset.armed) {
+                        redoBtn.dataset.armed = '';
+                        redoBtn.textContent = 'Redo';
+                    }
+                }, 2500);
+            }
+        };
+
         const copyBtn = document.createElement('button');
         copyBtn.className = 'copy-btn';
         copyBtn.textContent = 'Copy';
@@ -705,6 +827,7 @@ function renderMeetings() {
 
         header.appendChild(tblock);
         header.appendChild(openBtn);
+        header.appendChild(redoBtn);
         header.appendChild(copyBtn);
         header.appendChild(chev);
 
@@ -1232,6 +1355,7 @@ def _build_html():
         </div>
     </div>
 
+    <div id="meeting-action-status" class="field-hint" style="min-height: 14px; margin-bottom: 8px;"></div>
     <div id="meeting-list"></div>
 </div>
 
