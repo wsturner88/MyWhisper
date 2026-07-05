@@ -127,6 +127,18 @@ class MyWhisperApp(rumps.App):
     def __init__(self):
         super().__init__("MyWhisper", title=_TITLES["idle"], quit_button=None)
         log.info("=== MyWhisper starting ===")
+
+        # Hide the Dock icon. The venv's python re-execs Homebrew's
+        # Python.app binary, so macOS shows *that* bundle's Dock icon
+        # (the Python rocket) and our own Info.plist LSUIElement is
+        # never consulted. Setting the activation policy at runtime
+        # overrides it regardless of which binary is running us.
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication().setActivationPolicy_(1)
+            log.info("dock icon hidden (accessory activation policy)")
+        except Exception:
+            log.exception("could not hide Dock icon")
         self.cfg = config.load()
         self.out_dir = config.output_dir(self.cfg)
         self.state = "idle"

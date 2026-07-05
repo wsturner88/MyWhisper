@@ -39,6 +39,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"
 cp helper/mywhisper-sysaudio "$APP/Contents/Resources/mywhisper-sysaudio"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/MacOS/MyWhisper" <<EOF
 #!/bin/bash
