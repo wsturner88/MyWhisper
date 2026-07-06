@@ -156,6 +156,23 @@ def rewrite_meeting(path, title, stamp, summary_md, notes_md, transcript_md):
     return Path(path)
 
 
+def rename_meeting(path, title):
+    """Rename a saved meeting file so its name carries the title slug —
+    used when the title only becomes known (from the LLM) after the file
+    was already written. Keeps the date/time stamp. Returns the new path,
+    or the original if renaming isn't possible."""
+    path = Path(path)
+    m = re.match(r"(meeting_\d{4}-\d{2}-\d{2}_\d{4})", path.stem)
+    slug = _slug(title)
+    if not m or not slug:
+        return path
+    new = path.with_name(f"{m.group(1)}_{slug}.md")
+    if new == path or new.exists():
+        return path
+    path.rename(new)
+    return new
+
+
 def transcript_to_attributed(transcript_md):
     """Convert a stored markdown transcript ('**Me:** …') back to the
     plain attributed form the summarizer expects ('Me: …')."""

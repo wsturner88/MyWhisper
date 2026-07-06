@@ -653,6 +653,22 @@ class MyWhisperApp(rumps.App):
             except Exception:
                 log.exception("meeting: calendar lookup failed")
 
+            # Crash-safety: write the meeting to disk the moment the
+            # transcript exists. If the app dies or is quit during the
+            # LLM summary (it happened), the recording is not lost — the
+            # file is already there with a pending note, and the
+            # dashboard's Redo button can fill in the summary later.
+            cal_title = (cal_event.get("title") if cal_event else "") or ""
+            self._stage("Saving transcript…")
+            path = output.save_meeting(
+                config.app_dir(), transcript_md,
+                "## ⏳ Summary pending\n\nIf this note never fills in, the "
+                "app was closed mid-processing — open the Dashboard and "
+                "click Redo on this meeting to generate the summary.",
+                title=cal_title,
+                live_notes=getattr(self, "_meeting_notes", ""))
+            log.info("meeting: transcript saved early -> %s", path)
+
             title = ""
             try:
                 log.info("meeting: summarizing via LLM (provider=%s, model=%s)",
@@ -704,10 +720,15 @@ class MyWhisperApp(rumps.App):
                 )
 
             self._stage("Saving notes…")
-            path = output.save_meeting(config.app_dir(), transcript_md,
-                                       summary_md, title=title,
-                                       live_notes=getattr(
-                                           self, "_meeting_notes", ""))
+            final_title = title or cal_title
+            stamp = output.parse_meeting(path)["stamp"]
+            output.rewrite_meeting(path, final_title, stamp, summary_md,
+                                   getattr(self, "_meeting_notes", ""),
+                                   transcript_md)
+            if not cal_title and title:
+                # The LLM's title arrived after the early save — put it
+                # in the filename too.
+                path = output.rename_meeting(path, title)
             log.info("meeting: saved %s", path)
             self._last_meeting_path = str(path)
             if summary_failed:
