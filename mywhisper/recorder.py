@@ -45,16 +45,21 @@ class MicRecorder:
         self.samplerate = 48000
         self.device = None      # None = system default, else a device name
         self.level = 0.0        # live RMS level, drives the waveform indicator
+        self.max_level = 0.0    # loudest RMS this recording — tells "mic had
+                                # signal" apart from true silence afterwards
 
     def _callback(self, indata, frames, time_info, status):
         if self._file is not None:
             self._file.write(indata.copy())
         try:
             self.level = float(np.sqrt(np.mean(indata.astype("float64") ** 2)))
+            if self.level > self.max_level:
+                self.max_level = self.level
         except Exception:
             pass
 
     def start(self, out_path):
+        self.max_level = 0.0
         try:
             info = sd.query_devices(self.device, kind="input")
             self.samplerate = int(info["default_samplerate"])

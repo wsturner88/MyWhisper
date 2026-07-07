@@ -67,8 +67,12 @@ def _slug(title, max_len=60):
     return s[:max_len]
 
 
-def save_meeting(out_dir, transcript_md, summary_md, title="", live_notes=""):
-    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+def save_meeting(out_dir, transcript_md, summary_md, title="", live_notes="",
+                 stamp=None):
+    if stamp is None:
+        stamp = datetime.now()
+    if isinstance(stamp, datetime):
+        stamp = stamp.strftime("%Y-%m-%d_%H%M")
     slug = _slug(title)
     filename = f"meeting_{stamp}_{slug}.md" if slug else f"meeting_{stamp}.md"
     path = Path(out_dir) / filename

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MyWhisper 2.0 — app shell mockup</title>
+<style>
+  /* ---- tokens (June-inspired: one accent, quiet neutrals) ---- */
+  :root {
+    --brand: #c2453a;            /* MyWhisper red, dusty not electric */
+    --brand-wash: #f6ece9;
+    --bg: #efece7;               /* warm paper behind everything */
+    --card: #ffffff;
+    --ink: #26221d;
+    --ink-2: #6f6a62;
+    --ink-3: #a39d93;
+    --line: #e3ded6;
+    --hover: #e9e4dd;
+    --r-window: 10px;
+    --fs-body: 13px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--ink); font-size: var(--fs-body);
+         height: 100vh; display: grid; grid-template-columns: 232px 1fr; }
+
+  /* ---- sidebar (lives on the warm background) ---- */
+  .side { padding: 46px 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+  .side .search { display: flex; align-items: center; gap: 6px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+    color: var(--ink-3); font-size: 12px; margin-bottom: 10px; }
+  .side .search kbd { margin-left: auto; font-size: 10px; color: var(--ink-3);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; background: #fff; }
+  .nav-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+    border-radius: 7px; color: var(--ink-2); cursor: default; font-weight: 500; }
+  .nav-item.active { background: var(--hover); color: var(--ink); }
+  .nav-item:hover:not(.active) { background: var(--hover); }
+  .nav-item .ico { width: 15px; text-align: center; opacity: .75; }
+  .record { margin: 8px 2px 14px; display: flex; align-items: center; justify-content: center;
+    gap: 8px; background: var(--brand); color: #fff; border-radius: 8px; padding: 9px 0;
+    font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  .record .dot { width: 8px; height: 8px; border-radius: 4px; background: #fff; }
+  .group-label { font-size: 10.5px; color: var(--ink-3); padding: 12px 10px 4px;
+    font-weight: 600; }
+  .meeting-row { padding: 6px 10px; border-radius: 7px; color: var(--ink-2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; }
+  .meeting-row:hover { background: var(--hover); }
+  .meeting-row.sel { background: var(--hover); color: var(--ink); font-weight: 500; }
+  .meeting-row .when { color: var(--ink-3); font-size: 10.5px; display: block; }
+  .side .foot { margin-top: auto; padding: 10px; color: var(--ink-3); font-size: 11px; }
+
+  /* ---- main: the floating inset card (June's signature move) ---- */
+  .main { padding: 10px 10px 10px 0; }
+  .card { background: var(--card); height: 100%; border-radius: var(--r-window);
+    border: 1px solid var(--line);
+    box-shadow: 0 1px 3px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.05);
+    padding: 34px 44px; overflow-y: auto; }
+  .meta { color: var(--ink-3); font-size: 11.5px; margin-bottom: 10px; }
+  h1.title { font-size: 26px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 14px; }
+  .seg { display: inline-flex; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 2px; margin-bottom: 22px; }
+  .seg span { padding: 5px 14px; border-radius: 6px; font-size: 12px; color: var(--ink-2); }
+  .seg span.on { background: var(--card); color: var(--ink); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .actions { float: right; display: flex; gap: 6px; }
+  .btn { border: 1px solid var(--line); background: var(--card); border-radius: 7px;
+    padding: 5px 12px; font-size: 12px; color: var(--ink-2); }
+  .btn:hover { background: var(--hover); }
+  h2 { font-size: 15px; margin: 18px 0 8px; }
+  p, li { line-height: 1.65; color: var(--ink-2); font-size: 13.5px; }
+  ul { margin: 6px 0 6px 20px; }
+  b { color: var(--ink); font-weight: 600; }
+  .banner { background: var(--brand-wash); border: 1px solid #ecd9d4;
+    border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #8a4038;
+    margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<aside class="side">
+  <div class="search">🔍 Search everything… <kbd>⌘K</kbd></div>
+  <div class="record"><span class="dot"></span> Record a meeting</div>
+  <div class="nav-item active"><span class="ico">📋</span> Meetings</div>
+  <div class="nav-item"><span class="ico">🎙</span> Dictation</div>
+  <div class="nav-item"><span class="ico">📥</span> Import</div>
+  <div class="nav-item"><span class="ico">⚙️</span> Settings</div>
+
+  <div class="group-label">RECENT</div>
+  <div class="meeting-row sel">SEFI – Monthly Meeting<span class="when">Mon Jul 6 · 11:22 AM</span></div>
+  <div class="meeting-row">Account quoting process review<span class="when">Thu Jun 11 · 4:31 PM</span></div>
+  <div class="meeting-row">Bill – Craig Catchup<span class="when">Thu Jun 11 · 9:32 AM</span></div>
+  <div class="meeting-row">SEFI – ZF Bi-Weekly Catchup<span class="when">Wed Jun 10 · 4:36 PM</span></div>
+  <div class="meeting-row">Conservancy Meeting<span class="when">Sun Jun 7 · 11:48 AM</span></div>
+
+  <div class="foot">🎤 MyWhisper — everything on your Mac</div>
+</aside>
+
+<main class="main">
+  <div class="card">
+    <div class="actions">
+      <span class="btn">Copy</span><span class="btn">Redo summary</span><span class="btn">Open file</span>
+    </div>
+    <div class="meta">Monday, July 6 · 11:22 AM · 4 min 48 s · General Meeting</div>
+    <h1 class="title">SEFI – Monthly Meeting</h1>
+    <div class="seg"><span class="on">Notes</span><span>Transcript</span><span>My Notes</span></div>
+
+    <div class="banner">♻️ Recovered recording — rebuilt automatically after the app closed mid-processing.</div>
+
+    <h2>Summary</h2>
+    <ul>
+      <li>Solera discussion was deferred; follow-up may happen separately with <b>Marty</b>.</li>
+      <li><b>ZF quoted work:</b> a technical meeting still needs to be scheduled; feasibility commitments appear complete except final engineering confirmation.</li>
+      <li><b>Ricardo</b> is waiting on that engineering confirmation.</li>
+    </ul>
+    <h2>Action Items</h2>
+    <ul>
+      <li><b>Bill</b> to schedule the ZF technical meeting this week.</li>
+      <li><b>Chris</b> to send the revised feasibility exceptions to engineering.</li>
+    </ul>
+  </div>
+</main>
+
+</body>
+</html>

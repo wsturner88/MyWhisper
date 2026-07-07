@@ -39,6 +39,10 @@ log = logging.getLogger("mywhisper")
 # 0.3s at 16kHz — anything shorter is treated as "no audio captured".
 _MIN_SAMPLES = 4800
 
+# A recording whose loudest RMS window stayed under this was true silence;
+# above it, the mic clearly had signal (normal speech peaks ~0.02-0.06 RMS).
+_SPEECH_LEVEL = 0.015
+
 # Push-to-talk must be held at least this long, or it's treated as an
 # accidental tap and discarded without transcribing.
 _MIN_HOLD = 1.0
@@ -203,6 +207,7 @@ class MyWhisperApp(rumps.App):
         rumps.Timer(self._poll, 0.2).start()
         rumps.Timer(self._tick_waveform, 0.04).start()
         threading.Thread(target=self._prewarm, daemon=True).start()
+        threading.Thread(target=self._scan_recovery, daemon=True).start()
 
         try:
             _install_edit_menu()
@@ -244,6 +249,141 @@ class MyWhisperApp(rumps.App):
             log.info("prewarm: speech model ready")
         except Exception:
             log.exception("prewarm failed")
+
+    # -- crash recovery ------------------------------------------------
+    # Recordings live in the temp dir while a session is running and are
+    # deleted only on a clean finish, so audio found there at startup is
+    # a recording some crash orphaned. Bytes on disk win: move them to
+    # safety and rebuild what we can.
+
+    def _scan_recovery(self):
+        import glob
+        import soundfile as sf
+        time.sleep(10)   # let startup + model prewarm get going first
+        try:
+            now = time.time()
+            found = []
+            for p in sorted(glob.glob(
+                    os.path.join(tempfile.gettempdir(), "mywhisper_*.wav"))):
+                try:
+                    st = os.stat(p)
+                    if now - st.st_mtime < 120:
+                        continue   # fresh — could belong to a live recorder
+                    info = sf.info(p)
+                    dur = info.frames / float(info.samplerate or 1)
+                except Exception:
+                    continue
+                if dur < 5.0:
+                    _cleanup(p)    # an aborted tap, nothing worth saving
+                    continue
+                found.append({"path": p, "mtime": st.st_mtime,
+                              "dur": dur, "channels": info.channels})
+            if not found:
+                return
+
+            log.warning("recovery: found %d orphaned recording(s)", len(found))
+            rec_dir = config.app_dir() / "recovered"
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            for f in found:
+                ts = datetime.fromtimestamp(f["mtime"]).strftime("%Y-%m-%d_%H%M%S")
+                kind = "system" if f["channels"] > 1 else "mic"
+                dest = rec_dir / f"recovered_{ts}_{kind}.wav"
+                n = 1
+                while dest.exists():
+                    dest = rec_dir / f"recovered_{ts}_{kind}_{n}.wav"
+                    n += 1
+                shutil.move(f["path"], dest)
+                f["path"] = str(dest)
+
+            # Pair a mic track with a system track recorded at the same
+            # time (dual-channel meeting); a lone long mic track is a
+            # mic-only meeting; a lone short one is kept but not processed.
+            mics = [f for f in found if f["channels"] == 1]
+            syss = [f for f in found if f["channels"] > 1]
+            # Longest mic tracks first, and pair each with the candidate
+            # system track closest in duration — the two tracks of one
+            # meeting ran simultaneously, so their lengths nearly match.
+            mics.sort(key=lambda f: -f["dur"])
+            for mic in mics:
+                candidates = [s for s in syss
+                              if abs(s["mtime"] - mic["mtime"]) < 90]
+                sys_match = min(
+                    candidates,
+                    key=lambda s: abs(s["dur"] - mic["dur"]),
+                    default=None)
+                if sys_match:
+                    syss.remove(sys_match)
+                if sys_match or mic["dur"] >= 90:
+                    started = datetime.fromtimestamp(mic["mtime"] - mic["dur"])
+                    self._recover_meeting(
+                        mic["path"],
+                        sys_match["path"] if sys_match else None, started)
+                else:
+                    self._events.put((
+                        "notify", "Unfinished dictation recovered",
+                        "Audio saved in the recovered folder "
+                        "(menu → Open Notes Folder)."))
+        except Exception:
+            log.exception("recovery: scan failed")
+
+    def _recover_meeting(self, mic_path, sys_path, started_at):
+        log.info("recovery: rebuilding meeting from %s + %s",
+                 mic_path, sys_path or "(no system audio)")
+        self._events.put(("notify", "Recovering an unfinished meeting",
+                          "Found a recording that never finished — "
+                          "rebuilding it now."))
+        mic_data = audio.load_mono_16k(mic_path)
+        sys_data = audio.load_mono_16k(sys_path) if sys_path else None
+        segments, labeled = transcribe.transcribe_meeting(
+            mic_data, sys_data, self.cfg["whisper"]["model"],
+            initial_prompt=vocab.prompt())
+        if not segments:
+            log.warning("recovery: no speech in orphaned recording")
+            return
+        transcript_md = output.format_transcript(segments, labeled)
+        text = output.attributed_text(segments, labeled)
+
+        cal_event = None
+        try:
+            cal_event = calendar_lookup.find_meeting_near(started_at)
+        except Exception:
+            log.exception("recovery: calendar lookup failed")
+        cal_title = (cal_event.get("title") if cal_event else "") or ""
+
+        path = output.save_meeting(
+            config.app_dir(), transcript_md,
+            "## ⏳ Summary pending\n\nIf this never fills in, click Redo "
+            "on this meeting in the Dashboard.",
+            title=cal_title, stamp=started_at)
+
+        banner = ("> ♻️ Recovered recording — the app closed before this "
+                  "meeting finished processing; it was rebuilt "
+                  "automatically on restart.")
+        title = ""
+        try:
+            title, summary_md = summarize.summarize_transcript(
+                self.cfg, text, preset_id=config.get_meeting_preset())
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("empty summary")
+        except Exception as e:
+            log.exception("recovery: summary failed")
+            summary_md = (f"## ⚠️ Summary failed ({e})\n\nThe transcript "
+                          "below is intact — click Redo on this meeting "
+                          "in the Dashboard to try again.")
+        summary_md = f"{banner}\n\n{summary_md}"
+
+        stamp = output.parse_meeting(path)["stamp"]
+        output.rewrite_meeting(path, cal_title or title, stamp, summary_md,
+                               "", transcript_md)
+        if not cal_title and title:
+            path = output.rename_meeting(path, title)
+        log.info("recovery: rebuilt %s", path)
+        self._last_meeting_path = str(path)
+        self._events.put(("notify",
+                          f"Recovered: {cal_title or title or 'meeting'}",
+                          f"Click to open {path.name}",
+                          {"open_path": str(path)}))
+        self._events.put(("refresh_dashboard",))
 
     # -- meeting submenu rebuilds when presets change ------------------
     def _rebuild_meeting_submenu(self):
@@ -564,6 +704,9 @@ class MyWhisperApp(rumps.App):
                 log.info("dictation: queued paste of %d characters", len(text))
             else:
                 drops = transcribe.last_drops
+                had_signal = self.mic.max_level >= _SPEECH_LEVEL
+                log.info("dictation: empty transcript (max mic level %.4f)",
+                         self.mic.max_level)
                 if drops.get("non-english") or drops.get("repetition"):
                     # Whisper produced output but it was hallucinated junk —
                     # the audio reached us garbled. Very different problem
@@ -572,10 +715,16 @@ class MyWhisperApp(rumps.App):
                                       "Audio came through garbled — kept a "
                                       "copy as last_dictation.wav (menu → "
                                       "Open Notes Folder)."))
+                elif had_signal:
+                    # The mic clearly had signal, so an empty transcript is
+                    # a failure, not silence — don't gaslight the user.
+                    self._events.put(("notify", "Dictation",
+                                      "Heard audio but couldn't make out "
+                                      "words — try again? (kept a copy as "
+                                      "last_dictation.wav)"))
                 else:
                     self._events.put(("notify", "Dictation",
                                       "No speech detected."))
-                log.info("dictation: empty transcript")
         except Exception:
             log.exception("dictation: failed")
             self._events.put(("notify", "Dictation failed",
