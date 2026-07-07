@@ -195,11 +195,16 @@ def _generate_title(cfg, summary, transcript):
     )
     user = (
         "In 3 to 7 words, give a title that captures what this meeting was "
-        "about. Use plain English. No quotes.\n\n"
+        "about. Lead with the company, client, or project name when one is "
+        "central (e.g. 'SEFI Pricing Step-Down Review', 'Cultraro Seat "
+        "Damper Feasibility'). Use plain English. No quotes.\n\n"
         f"{source}"
     )
     try:
-        title = llm.chat(cfg, system, user, max_tokens=40)
+        # Generous budget: reasoning models (gpt-5.5 etc.) spend tokens
+        # thinking before they emit the ~10-token title; 40 starved them
+        # into returning nothing at all.
+        title = llm.chat(cfg, system, user, max_tokens=1500)
     except Exception:
         log.exception("title generation failed")
         return ""

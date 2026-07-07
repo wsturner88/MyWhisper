@@ -188,7 +188,9 @@ def _openrouter(key, model, system, user, max_tokens, on_token=None):
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # Reasoning models return content=None when the token budget is
+        # spent on thinking — treat that as empty, not a crash.
+        return (resp.json()["choices"][0]["message"]["content"] or "").strip()
 
     # Streaming via OpenAI-style SSE
     resp = requests.post(

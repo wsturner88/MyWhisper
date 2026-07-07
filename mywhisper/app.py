@@ -373,14 +373,14 @@ class MyWhisperApp(rumps.App):
         summary_md = f"{banner}\n\n{summary_md}"
 
         stamp = output.parse_meeting(path)["stamp"]
-        output.rewrite_meeting(path, cal_title or title, stamp, summary_md,
+        output.rewrite_meeting(path, title or cal_title, stamp, summary_md,
                                "", transcript_md)
-        if not cal_title and title:
+        if title:
             path = output.rename_meeting(path, title)
         log.info("recovery: rebuilt %s", path)
         self._last_meeting_path = str(path)
         self._events.put(("notify",
-                          f"Recovered: {cal_title or title or 'meeting'}",
+                          f"Recovered: {title or cal_title or 'meeting'}",
                           f"Click to open {path.name}",
                           {"open_path": str(path)}))
         self._events.put(("refresh_dashboard",))
@@ -827,6 +827,10 @@ class MyWhisperApp(rumps.App):
                 def _on_stage(stage_text, chars):
                     self.meeting_panel.set_processing(stage_text, chars)
 
+                # The calendar event is passed as CONTEXT (real attendee
+                # names beat "Speaker 1") but the title comes from what
+                # was actually said — calendar titles proved unreliable
+                # (generic, or a nearby event that wasn't this meeting).
                 title, summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
@@ -834,8 +838,6 @@ class MyWhisperApp(rumps.App):
                     live_notes=getattr(self, "_meeting_notes", ""),
                     on_stage=_on_stage,
                 )
-                if cal_event and cal_event.get("title"):
-                    title = cal_event["title"]
                 if not summary_md or not summary_md.strip():
                     raise RuntimeError("Empty summary returned by LLM.")
                 if title:
@@ -869,14 +871,14 @@ class MyWhisperApp(rumps.App):
                 )
 
             self._stage("Saving notes…")
-            final_title = title or cal_title
+            final_title = title or cal_title   # calendar = fallback only
             stamp = output.parse_meeting(path)["stamp"]
             output.rewrite_meeting(path, final_title, stamp, summary_md,
                                    getattr(self, "_meeting_notes", ""),
                                    transcript_md)
-            if not cal_title and title:
-                # The LLM's title arrived after the early save — put it
-                # in the filename too.
+            if title:
+                # The content title arrived after the early save — put
+                # it in the filename too (replaces any calendar slug).
                 path = output.rename_meeting(path, title)
             log.info("meeting: saved %s", path)
             self._last_meeting_path = str(path)
