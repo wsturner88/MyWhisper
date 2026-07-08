@@ -523,6 +523,31 @@ def _act_record_meeting(body):
         log.exception("dashboard: record trigger failed")
 
 
+def _act_delete_meeting(body):
+    """Move a meeting file to the macOS Trash — recoverable, never rm."""
+    name = os.path.basename(str(body.get("value") or ""))
+    path = config.app_dir() / name
+    if not (name.startswith("meeting_") and name.endswith(".md")
+            and path.exists()):
+        _call_js("onDeleteDone",
+                 {"ok": False, "filename": name, "error": "File not found."})
+        return
+    try:
+        from Foundation import NSFileManager
+        ok, _moved_to, err = (
+            NSFileManager.defaultManager()
+            .trashItemAtURL_resultingItemURL_error_(
+                NSURL.fileURLWithPath_(str(path)), None, None))
+        if not ok:
+            raise RuntimeError(str(err) if err else "Trash refused the file.")
+        log.info("dashboard: moved %s to Trash", name)
+        _call_js("onDeleteDone", {"ok": True, "filename": name})
+    except Exception as e:
+        log.exception("dashboard: delete failed")
+        _call_js("onDeleteDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
 def _act_open_meeting(body):
     """Open a meeting .md file in the default editor. Only basenames of
     real meeting files inside the data folder are accepted."""
@@ -584,6 +609,7 @@ _ACTIONS = {
     "record_meeting": _act_record_meeting,
     "resummarize_meeting": _act_resummarize_meeting,
     "save_meeting_part": _act_save_meeting_part,
+    "delete_meeting": _act_delete_meeting,
     "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,

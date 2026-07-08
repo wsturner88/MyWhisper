@@ -122,15 +122,39 @@ function renderSidebarList() {
     shown++;
     const row = document.createElement("div");
     row.className = "meeting-row" + (i === selectedMeeting ? " sel" : "");
+
+    const main = document.createElement("div");
+    main.className = "rowmain";
     const t = document.createElement("div");
     t.className = "t";
     t.textContent = m.title;
     const w = document.createElement("div");
     w.className = "w";
     w.textContent = m.when;
-    row.appendChild(t);
-    row.appendChild(w);
-    row.onclick = () => selectMeeting(i);
+    main.appendChild(t);
+    main.appendChild(w);
+    main.onclick = () => selectMeeting(i);
+
+    const del = document.createElement("button");
+    del.className = "row-del";
+    del.textContent = "✕";
+    del.title = "Move to Trash";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (del.dataset.armed) {
+        del.textContent = "…";
+        send("delete_meeting", m.filename);
+      } else {
+        del.dataset.armed = "1";
+        del.textContent = "Delete?";
+        setTimeout(() => {
+          if (del.dataset.armed) { del.dataset.armed = ""; del.textContent = "✕"; }
+        }, 2500);
+      }
+    };
+
+    row.appendChild(main);
+    row.appendChild(del);
     list.appendChild(row);
   });
   if (!shown) {
@@ -198,6 +222,7 @@ function renderReader() {
       '<button class="btn" id="btn-copy">Copy</button>' +
       '<button class="btn" id="btn-redo">Redo summary</button>' +
       '<button class="btn" id="btn-open">Open file</button>' +
+      '<button class="btn danger" id="btn-delete">Delete</button>' +
     "</div>" +
     '<h1 class="reader-title">' + escapeHtml(m.title) + "</h1>" +
     '<div class="seg" id="reader-tabs">' +
@@ -212,6 +237,20 @@ function renderReader() {
   $("btn-copy").onclick = (e) => copyToClipboard(m.content, e);
   $("btn-open").onclick = () => send("open_meeting", m.filename);
   $("btn-redo").onclick = () => { redoOpen = !redoOpen; renderReader(); };
+  $("btn-delete").onclick = (e) => {
+    const btn = e.target;
+    if (btn.dataset.armed) {
+      btn.disabled = true;
+      btn.textContent = "Deleting…";
+      send("delete_meeting", m.filename);
+    } else {
+      btn.dataset.armed = "1";
+      btn.textContent = "Move to Trash?";
+      setTimeout(() => {
+        if (btn.dataset.armed) { btn.dataset.armed = ""; btn.textContent = "Delete"; }
+      }, 2500);
+    }
+  };
   el.querySelectorAll("#reader-tabs button").forEach(b => {
     b.onclick = () => { readerTab = b.dataset.tab; editingPart = null; renderReader(); };
   });
@@ -257,6 +296,36 @@ function renderReader() {
     $("btn-redo-cancel").onclick = () => { redoOpen = false; renderReader(); };
   }
 }
+
+window.onDeleteDone = function (p) {
+  if (!p.ok) {
+    const s = $("reader-status");
+    if (s) { s.className = "status-line err"; s.textContent = "✗ " + (p.error || "Delete failed."); }
+    const b = $("btn-delete");
+    if (b) { b.disabled = false; b.dataset.armed = ""; b.textContent = "Delete"; }
+    renderSidebarList();
+    return;
+  }
+  const idx = MEETINGS.findIndex(m => m.filename === p.filename);
+  if (idx !== -1) {
+    MEETINGS.splice(idx, 1);
+    if (selectedMeeting === idx) {
+      selectedMeeting = MEETINGS.length ? Math.min(idx, MEETINGS.length - 1) : -1;
+      editingPart = null;
+      redoOpen = false;
+    } else if (selectedMeeting > idx) {
+      selectedMeeting--;
+    }
+  }
+  renderSidebarList();
+  renderReader();
+  const s = $("reader-status");
+  if (s) {
+    s.className = "status-line ok";
+    s.textContent = "✓ Moved to Trash (recoverable from the macOS Trash)";
+    setTimeout(() => { if (s.textContent.includes("Trash")) s.textContent = ""; }, 5000);
+  }
+};
 
 window.onSavePartDone = function (p) {
   const idx = MEETINGS.findIndex(m => m.filename === p.filename);

@@ -163,12 +163,16 @@ body {
 }
 
 .meeting-row {
-  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 6px 6px 10px;
   border-radius: 7px;
   cursor: pointer;
 }
 .meeting-row:hover { background: var(--hover); }
 .meeting-row.sel { background: var(--hover); }
+.meeting-row .rowmain { flex: 1; min-width: 0; }
 .meeting-row .t {
   color: var(--ink-2);
   font-size: 12.5px;
@@ -178,6 +182,20 @@ body {
 }
 .meeting-row.sel .t { color: var(--ink); font-weight: 500; }
 .meeting-row .w { color: var(--ink-3); font-size: 10.5px; margin-top: 1px; }
+.row-del {
+  visibility: hidden;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 3px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.meeting-row:hover .row-del { visibility: visible; }
+.row-del:hover { color: var(--err); background: var(--bg); }
 
 .side-foot {
   padding: 8px 10px 0;
@@ -251,6 +269,7 @@ body {
 .btn.primary:hover { filter: brightness(1.06); }
 .btn.copied { background: var(--ok); border-color: var(--ok); color: #fff; }
 .btn:disabled { opacity: .5; cursor: default; }
+.btn.danger:hover { background: var(--err); border-color: var(--err); color: #fff; }
 
 .seg {
   display: inline-flex;
