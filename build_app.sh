@@ -20,9 +20,13 @@ if [ -z "$PYTHON" ]; then
   echo "    Install a newer Python with:  brew install python@3.12"
 fi
 echo "    using $PYTHON ($($PYTHON --version 2>&1))"
-"$PYTHON" -m venv .venv
-./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install -r requirements.txt
+# The venv lives OUTSIDE the project folder: this folder syncs through
+# OneDrive, and a synced venv corrupts (dataless placeholders, conflict
+# copies) once a second Mac joins the sync.
+VENV="${MYWHISPER_VENV:-$HOME/.mywhisper-venv}"
+"$PYTHON" -m venv "$VENV"
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install -r requirements.txt
 
 echo "==> [2/3] System-audio helper (Swift / ScreenCaptureKit)"
 if ! command -v swiftc >/dev/null 2>&1; then
@@ -43,9 +47,15 @@ cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/MacOS/MyWhisper" <<EOF
 #!/bin/bash
+# Start (or restart) MyWhisper. When the start-at-login service is
+# installed, kick it — that guarantees a single instance. Otherwise run
+# the app directly.
+if launchctl print "gui/\$(id -u)/local.mywhisper" >/dev/null 2>&1; then
+  exec launchctl kickstart -k "gui/\$(id -u)/local.mywhisper"
+fi
 export MYWHISPER_HELPER="$ROOT/MyWhisper.app/Contents/Resources/mywhisper-sysaudio"
 cd "$ROOT"
-exec "$ROOT/.venv/bin/python" -m mywhisper
+exec "\${MYWHISPER_VENV:-\$HOME/.mywhisper-venv}/bin/python" -m mywhisper
 EOF
 chmod +x "$APP/Contents/MacOS/MyWhisper"
 

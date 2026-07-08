@@ -5,8 +5,10 @@ The agent launches the app directly as a Python process. Launching via a
 app must always start as a naked process.
 """
 
+import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 LABEL = "local.mywhisper"
@@ -17,6 +19,19 @@ def _project_root():
     return Path(__file__).resolve().parent.parent
 
 
+def _python():
+    """The interpreter to relaunch with. Prefer the one running right
+    now — it is by definition correct — falling back to the standard
+    venv location (which lives OUTSIDE the OneDrive-synced project, see
+    run.sh)."""
+    exe = sys.executable
+    if exe and os.path.exists(exe):
+        return exe
+    venv = os.environ.get("MYWHISPER_VENV",
+                          str(Path.home() / ".mywhisper-venv"))
+    return str(Path(venv) / "bin" / "python")
+
+
 def is_enabled():
     return PLIST_PATH.exists()
 
@@ -25,8 +40,7 @@ def enable():
     root = _project_root()
     plist = {
         "Label": LABEL,
-        "ProgramArguments": [
-            str(root / ".venv" / "bin" / "python"), "-m", "mywhisper"],
+        "ProgramArguments": [_python(), "-m", "mywhisper"],
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {
             "MYWHISPER_HELPER": str(root / "helper" / "mywhisper-sysaudio")},
