@@ -19,9 +19,30 @@
     --fs-body: 13px;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   }
+  /* ---- dark variant: same layout, MyWhisper's night look ---- */
+  body.dark {
+    --brand: #e05a4e;
+    --brand-wash: #3a2422;
+    --bg: #16161f;
+    --card: #1f1f2b;
+    --ink: #eceae6;
+    --ink-2: #a5a1ae;
+    --ink-3: #6e6a7a;
+    --line: #313140;
+    --hover: #2a2a39;
+  }
+  body.dark .banner { border-color: #4a2f2b; color: #e0a79f; }
+  body.dark .record { box-shadow: 0 1px 3px rgba(0,0,0,.5); }
+  body.dark .card { box-shadow: 0 1px 3px rgba(0,0,0,.35), 0 8px 24px rgba(0,0,0,.3); }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: var(--bg); color: var(--ink); font-size: var(--fs-body);
          height: 100vh; display: grid; grid-template-columns: 232px 1fr; }
+  .theme-toggle {
+    position: fixed; right: 18px; bottom: 14px; z-index: 9;
+    background: var(--card); color: var(--ink-2); border: 1px solid var(--line);
+    border-radius: 999px; padding: 7px 14px; font-size: 12px; cursor: pointer;
+  }
 
   /* ---- sidebar (lives on the warm background) ---- */
   .side { padding: 46px 10px 12px; display: flex; flex-direction: column; gap: 2px; }
@@ -118,6 +139,10 @@
     </ul>
   </div>
 </main>
+
+<button class="theme-toggle" onclick="document.body.classList.toggle('dark');
+  this.textContent = document.body.classList.contains('dark') ? '☀️ Light look' : '🌙 Dark look';">
+  🌙 Dark look</button>
 
 </body>
 </html>
