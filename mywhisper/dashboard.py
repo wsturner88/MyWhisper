@@ -397,11 +397,60 @@ def _act_import_transcript(body):
     threading.Thread(target=_work, daemon=True).start()
 
 
+def _meeting_payload(path):
+    """Freshly parsed parts + raw content, in the shape app.js expects."""
+    parts = output.parse_meeting(path)
+    return {
+        "title": parts.get("title", ""),
+        "summary_md": parts.get("summary_md", ""),
+        "notes_md": parts.get("notes_md", ""),
+        "transcript_md": parts.get("transcript_md", ""),
+        "content": Path(path).read_text(),
+    }
+
+
+def _act_save_meeting_part(body):
+    """Inline edit from the reader — replace the summary or the typed
+    notes of a saved meeting, leaving everything else untouched."""
+    val = body.get("value") or {}
+    name = os.path.basename(str(val.get("filename") or ""))
+    part = val.get("part")
+    text = str(val.get("text") or "").strip()
+    path = config.app_dir() / name
+    if not (name.startswith("meeting_") and name.endswith(".md")
+            and path.exists() and part in ("summary", "notes")):
+        _call_js("onSavePartDone",
+                 {"ok": False, "filename": name, "error": "Bad request."})
+        return
+    try:
+        parts = output.parse_meeting(path)
+        output.rewrite_meeting(
+            path, parts["title"], parts["stamp"],
+            text if part == "summary" else parts["summary_md"],
+            text if part == "notes" else parts["notes_md"],
+            parts["transcript_md"])
+        log.info("dashboard: edited %s of %s", part, name)
+        _call_js("onSavePartDone",
+                 {"ok": True, "filename": name,
+                  "meeting": _meeting_payload(path)})
+    except Exception as e:
+        log.exception("dashboard: save meeting part failed")
+        _call_js("onSavePartDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
 def _act_resummarize_meeting(body):
     """Re-run the AI summary for an existing meeting from its saved
     transcript — no re-recording. Useful after switching to a better
-    model or when a summary came out weak."""
-    name = os.path.basename(str(body.get("value") or ""))
+    model, when a summary came out weak, or with a different meeting
+    type ('preset' in the payload)."""
+    val = body.get("value")
+    preset = None
+    if isinstance(val, dict):
+        name = os.path.basename(str(val.get("filename") or ""))
+        preset = str(val.get("preset") or "").strip() or None
+    else:
+        name = os.path.basename(str(val or ""))
     path = config.app_dir() / name
     if not (name.startswith("meeting_") and name.endswith(".md")
             and path.exists()):
@@ -423,6 +472,7 @@ def _act_resummarize_meeting(body):
                      {"filename": name, "stage": "Re-summarizing…"})
             _new_title, summary_md = summarize.summarize_transcript(
                 config.load(), llm_input,
+                preset_id=preset,
                 live_notes=parts["notes_md"],
                 on_stage=lambda stage, chars=0: _call_js(
                     "onResummarizeStage",
@@ -533,6 +583,7 @@ _ACTIONS = {
     "open_meeting": _act_open_meeting,
     "record_meeting": _act_record_meeting,
     "resummarize_meeting": _act_resummarize_meeting,
+    "save_meeting_part": _act_save_meeting_part,
     "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,

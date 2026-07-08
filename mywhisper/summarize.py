@@ -1,7 +1,7 @@
 import logging
 import time
 
-from . import calendar_lookup, config, llm
+from . import calendar_lookup, config, llm, vocab
 
 log = logging.getLogger("mywhisper")
 
@@ -84,6 +84,7 @@ def summarize_transcript(cfg, transcript_text, preset_id=None,
     cal_block = calendar_lookup.context_block(calendar_event)
     notes_block = _user_notes_block(live_notes)
     speaker_block = _speaker_convention_block(transcript_text)
+    vocab_block = _vocab_block()
 
     def _stage(label):
         if on_stage:
@@ -117,7 +118,7 @@ def summarize_transcript(cfg, transcript_text, preset_id=None,
             user = (
                 f"This is part {i} of {len(chunks)} of a meeting transcript "
                 f"for a **{preset['label']}**.\n\n"
-                f"{cal_block}{notes_block}{speaker_block}\n"
+                f"{cal_block}{notes_block}{speaker_block}{vocab_block}\n"
                 f"Pull out {preset['focus']} from this part. Use the real "
                 f"attendee names from the calendar context above instead of "
                 f"'Speaker 1' / 'Speaker 2' / 'Others' where you can tell who "
@@ -134,7 +135,7 @@ def summarize_transcript(cfg, transcript_text, preset_id=None,
     _stage("Writing final summary")
     final = (
         f"Below are notes from a **{preset['label']}**.\n\n"
-        f"{cal_block}{notes_block}{speaker_block}\n"
+        f"{cal_block}{notes_block}{speaker_block}{vocab_block}\n"
         f"Produce final meeting notes in Markdown with exactly these sections:\n\n"
         "## Summary\n## Key Decisions\n## Action Items\n## Open Questions\n\n"
         f"Use bullet points. Use real attendee names from the calendar "
@@ -167,6 +168,25 @@ def _speaker_convention_block(transcript_text):
             "speaking; otherwise keep them as 'the other participants'.\n\n"
         )
     return ""
+
+
+def _vocab_block():
+    """The user's vocabulary as a correction dictionary for the LLM.
+    Whisper only gets the bare terms as a sound-alike hint; the
+    summarizer gets the full annotated lines so it can repair
+    mis-heard names ('Edger' -> 'Edgar', 'Inject Tech' -> 'Injectec')."""
+    ctx = vocab.llm_context()
+    if not ctx:
+        return ""
+    return (
+        "### Reference dictionary (user-maintained spellings)\n"
+        "People, companies, and terms as the user spells them; the "
+        "transcript may mis-hear these.\n"
+        f"{ctx}\n"
+        "When the transcript contains a plausible mis-hearing of one of "
+        "these, use the exact dictionary spelling. Never insert a "
+        "dictionary term the speaker did not plausibly say.\n\n"
+    )
 
 
 def _user_notes_block(live_notes):

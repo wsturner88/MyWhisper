@@ -41,6 +41,18 @@ def load_terms():
     return []
 
 
+def llm_context(max_chars=1500):
+    """Vocabulary lines for LLM prompts. Unlike prompt() (Whisper's
+    sound-alike hint), the annotations are kept — 'Marty Cohen -
+    StewartEFI - Sales Manager' and '(heard as: Inject Tech)' are
+    exactly what a summarizer needs to fix mis-heard names."""
+    terms = load_terms()
+    if not terms:
+        return ""
+    text = "\n".join(f"- {t}" for t in terms)
+    return text[:max_chars]
+
+
 def _term_only(line):
     """Strip annotations: 'Marty Cohen - StewartEFI - Sales Manager' ->
     'Marty Cohen'. The annotations (roles, 'heard as' mishearings) must

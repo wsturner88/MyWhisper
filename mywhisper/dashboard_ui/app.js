@@ -99,6 +99,8 @@ function switchView(name) {
 function selectMeeting(i) {
   selectedMeeting = i;
   readerTab = "notes";
+  editingPart = null;
+  redoOpen = false;
   switchView("meetings");
   renderSidebarList();
   renderReader();
@@ -141,6 +143,9 @@ function renderSidebarList() {
 
 // ---- meeting reader ----
 
+let editingPart = null;   // null | "notes" | "mynotes"
+let redoOpen = false;
+
 function renderReader() {
   const el = $("view-meetings");
   if (selectedMeeting < 0 || !MEETINGS[selectedMeeting]) {
@@ -149,17 +154,47 @@ function renderReader() {
   }
   const m = MEETINGS[selectedMeeting];
   const tabs = [["notes", "Notes"], ["transcript", "Transcript"]];
-  if ((m.notes_md || "").trim()) tabs.push(["mynotes", "My Notes"]);
+  if ((m.notes_md || "").trim() || editingPart === "mynotes") tabs.push(["mynotes", "My Notes"]);
   if (!tabs.some(t => t[0] === readerTab)) readerTab = "notes";
 
-  const body = readerTab === "notes" ? m.summary_md
+  const raw = readerTab === "notes" ? m.summary_md
     : readerTab === "transcript" ? m.transcript_md
     : m.notes_md;
+  const editable = readerTab !== "transcript";
+  const isEditing = editingPart === readerTab;
+
+  let bodyHtml;
+  if (isEditing) {
+    bodyHtml =
+      '<textarea id="edit-area" style="min-height: 340px;"></textarea>' +
+      '<div class="field-row" style="margin-top: 10px;">' +
+        '<button class="btn primary" id="btn-save-edit">Save</button>' +
+        '<button class="btn" id="btn-cancel-edit">Cancel</button>' +
+        '<span class="field-hint">Plain text with markdown — ## headings, ' +
+        '**bold**, - bullets.</span>' +
+      "</div>";
+  } else {
+    bodyHtml = '<div class="md">' + mdToHtml(raw || "_(empty)_") + "</div>";
+  }
+
+  const redoHtml = !redoOpen ? "" :
+    '<div class="settings-section" id="redo-panel" style="margin-bottom: 14px;">' +
+      "<h3>Redo the AI summary</h3>" +
+      '<div class="section-desc">Re-runs the AI on the saved transcript. ' +
+        "Your typed notes and the transcript stay untouched — only the " +
+        "summary is replaced.</div>" +
+      '<div class="field"><label class="field-label">Meeting type</label>' +
+        '<select id="redo-preset"></select></div>' +
+      '<div class="field-row">' +
+        '<button class="btn primary" id="btn-redo-go">Regenerate summary</button>' +
+        '<button class="btn" id="btn-redo-cancel">Cancel</button>' +
+      "</div></div>";
 
   el.innerHTML =
     '<div class="reader-top">' +
       '<div class="reader-meta">' + escapeHtml(m.when) +
         (m.when ? " · " : "") + escapeHtml(m.filename) + "</div>" +
+      (editable && !isEditing ? '<button class="btn" id="btn-edit">Edit</button>' : "") +
       '<button class="btn" id="btn-copy">Copy</button>' +
       '<button class="btn" id="btn-redo">Redo summary</button>' +
       '<button class="btn" id="btn-open">Open file</button>' +
@@ -170,32 +205,75 @@ function renderReader() {
         '<button data-tab="' + id + '"' + (id === readerTab ? ' class="on"' : "") + ">" +
         label + "</button>").join("") +
     "</div>" +
+    redoHtml +
     '<div class="status-line" id="reader-status"></div>' +
-    '<div class="md">' + mdToHtml(body || "_(empty)_") + "</div>";
+    bodyHtml;
 
   $("btn-copy").onclick = (e) => copyToClipboard(m.content, e);
   $("btn-open").onclick = () => send("open_meeting", m.filename);
-  $("btn-redo").onclick = (e) => armRedo(e.target, m.filename);
+  $("btn-redo").onclick = () => { redoOpen = !redoOpen; renderReader(); };
   el.querySelectorAll("#reader-tabs button").forEach(b => {
-    b.onclick = () => { readerTab = b.dataset.tab; renderReader(); };
+    b.onclick = () => { readerTab = b.dataset.tab; editingPart = null; renderReader(); };
   });
-}
 
-// Two-click confirm (WKWebView suppresses confirm() dialogs).
-function armRedo(btn, filename) {
-  if (btn.dataset.armed) {
-    btn.dataset.armed = "";
-    btn.textContent = "Working…";
-    btn.disabled = true;
-    send("resummarize_meeting", filename);
-  } else {
-    btn.dataset.armed = "1";
-    btn.textContent = "Replace summary?";
-    setTimeout(() => {
-      if (btn.dataset.armed) { btn.dataset.armed = ""; btn.textContent = "Redo summary"; }
-    }, 2500);
+  if (editable && !isEditing) {
+    $("btn-edit").onclick = () => { editingPart = readerTab; redoOpen = false; renderReader(); };
+  }
+
+  if (isEditing) {
+    const area = $("edit-area");
+    area.value = raw || "";
+    area.focus();
+    $("btn-save-edit").onclick = () => {
+      $("btn-save-edit").disabled = true;
+      send("save_meeting_part", {
+        filename: m.filename,
+        part: readerTab === "mynotes" ? "notes" : "summary",
+        text: area.value
+      });
+    };
+    $("btn-cancel-edit").onclick = () => { editingPart = null; renderReader(); };
+  }
+
+  if (redoOpen) {
+    const sel = $("redo-preset");
+    const addOpt = (p) => {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = p.label;
+      if (p.id === state.meeting_preset) o.selected = true;
+      sel.appendChild(o);
+    };
+    state.builtin_presets.forEach(addOpt);
+    (state.custom_presets || []).forEach(addOpt);
+    $("btn-redo-go").onclick = () => {
+      redoOpen = false;
+      renderReader();
+      const s = $("reader-status");
+      s.className = "status-line";
+      s.textContent = "↻ Re-summarizing…";
+      send("resummarize_meeting", { filename: m.filename, preset: sel.value });
+    };
+    $("btn-redo-cancel").onclick = () => { redoOpen = false; renderReader(); };
   }
 }
+
+window.onSavePartDone = function (p) {
+  const idx = MEETINGS.findIndex(m => m.filename === p.filename);
+  if (p.ok && idx !== -1) {
+    Object.assign(MEETINGS[idx], p.meeting || {});
+    editingPart = null;
+    if (idx === selectedMeeting) renderReader();
+    renderSidebarList();
+    const s = $("reader-status");
+    if (s) { s.className = "status-line ok"; s.textContent = "✓ Saved"; setTimeout(renderReader, 2500); }
+  } else {
+    const s = $("reader-status");
+    if (s) { s.className = "status-line err"; s.textContent = "✗ " + (p.error || "Save failed."); }
+    const b = $("btn-save-edit");
+    if (b) b.disabled = false;
+  }
+};
 
 window.onResummarizeStage = function (p) {
   const s = $("reader-status");
