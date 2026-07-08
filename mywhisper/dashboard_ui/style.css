@@ -51,6 +51,10 @@ body {
   color: var(--ink);
   display: grid;
   grid-template-columns: 232px 1fr;
+  /* Pin the single row to the window height — without this the row
+     grows with content (Settings!) and the card's own scrollbar never
+     engages because the overflow is clipped at the body instead. */
+  grid-template-rows: minmax(0, 1fr);
   -webkit-user-select: none;
   user-select: none;
   overflow: hidden;
@@ -189,7 +193,7 @@ body {
 
 /* ---------- main card ---------- */
 
-.main { padding: 10px 10px 10px 0; min-width: 0; }
+.main { padding: 10px 10px 10px 0; min-width: 0; min-height: 0; }
 
 .card {
   background: var(--card);
