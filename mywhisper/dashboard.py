@@ -16,9 +16,9 @@ from pathlib import Path
 
 import objc
 from AppKit import (
-    NSPanel, NSScreen, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
-    NSWindowStyleMaskResizable, NSWindowStyleMaskUtilityWindow,
-    NSBackingStoreBuffered, NSFloatingWindowLevel, NSColor,
+    NSWindow, NSScreen, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
+    NSBackingStoreBuffered, NSColor,
     NSWindowStyleMaskFullSizeContentView, NSApp,
     NSMakeRect, NSMakeSize, NSOpenPanel, NSObject, NSURL,
 )
@@ -574,8 +574,6 @@ _BODY = """
   <div class="side-top">
     <div class="search">&#128269; <input id="side-search" type="text"
          placeholder="Search everything&#8230;"></div>
-    <button class="close-app-btn" onclick="send('close_panel', null)"
-            title="Close">&#10005;</button>
   </div>
   <button class="record-btn" onclick="recordMeeting()">
     <span class="dot"></span> <span id="record-btn-label">Record a meeting</span>
@@ -820,35 +818,34 @@ def _create_panel():
     global _panel, _webview, _bridge
 
     screen = NSScreen.mainScreen().frame()
-    x = screen.size.width - _PANEL_W - 12
-    y = screen.size.height - _PANEL_H - 36
+    x = (screen.size.width - _PANEL_W) / 2.0
+    y = (screen.size.height - _PANEL_H) / 2.0
 
+    # A real app window: traffic lights, minimize, normal stacking (no
+    # always-on-top), remembered size/position. The title bar stays
+    # transparent and the content extends underneath it, so the traffic
+    # lights float over the sidebar.
     style = (
         NSWindowStyleMaskTitled
+        | NSWindowStyleMaskClosable
+        | NSWindowStyleMaskMiniaturizable
         | NSWindowStyleMaskResizable
-        | NSWindowStyleMaskUtilityWindow
         | NSWindowStyleMaskFullSizeContentView
     )
     rect = NSMakeRect(x, y, _PANEL_W, _PANEL_H)
-    _panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+    _panel = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         rect, style, NSBackingStoreBuffered, False,
     )
     _panel.setTitle_("MyWhisper")
     _panel.setTitleVisibility_(1)  # NSWindowTitleVisibilityHidden
     _panel.setTitlebarAppearsTransparent_(True)
-    _panel.setLevel_(NSFloatingWindowLevel)
-    _panel.setBecomesKeyOnlyIfNeeded_(False)
-    _panel.setHidesOnDeactivate_(False)
-    _panel.setBackgroundColor_(NSColor.colorWithRed_green_blue_alpha_(
-        0.102, 0.102, 0.18, 1.0
-    ))
+    # Closing hides the window (the app lives in the menu bar); without
+    # this the window object would be deallocated on close.
+    _panel.setReleasedWhenClosed_(False)
+    _panel.setBackgroundColor_(NSColor.windowBackgroundColor())
     _panel.setMinSize_(NSMakeSize(840, 560))
-
-    # Hide the traffic-light buttons; we draw our own close button in HTML.
-    for btn_index in (0, 1, 2):   # close, miniaturize, zoom
-        btn = _panel.standardWindowButton_(btn_index)
-        if btn is not None:
-            btn.setHidden_(True)
+    # Remember size/position across opens and app restarts.
+    _panel.setFrameAutosaveName_("MyWhisperDashboard")
 
     # Configure WKWebView with a script message handler so JS can call us.
     wk_config = WKWebViewConfiguration.alloc().init()

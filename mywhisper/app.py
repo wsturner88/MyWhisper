@@ -102,6 +102,20 @@ def _install_edit_menu():
     holder.setSubmenu_(edit)
     main.addItem_(holder)
 
+    # Window shortcuts so the dashboard behaves like a real app window:
+    # Cmd-W closes (hides) it, Cmd-M minimizes it.
+    window_menu = NSMenu.alloc().initWithTitle_("Window")
+    for title, sel, key in (
+            ("Close Window", "performClose:", "w"),
+            ("Minimize", "performMiniaturize:", "m")):
+        window_menu.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, sel, key))
+    wholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Window", None, "")
+    wholder.setSubmenu_(window_menu)
+    main.addItem_(wholder)
+
 
 @rumps.notifications
 def _on_notification_click(info):
