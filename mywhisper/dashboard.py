@@ -24,7 +24,8 @@ from AppKit import (
 )
 from Foundation import NSURL as FNSURL
 
-from . import config, dictation_log, autostart, vocab, recorder, screen_recording
+from . import (config, dictation_log, autostart, output, vocab, recorder,
+               screen_recording)
 
 log = logging.getLogger("mywhisper")
 
@@ -39,7 +40,7 @@ WKUserContentController = objc.lookUpClass("WKUserContentController")
 _panel = None
 _webview = None
 _bridge = None  # NSObject delegate; keep a reference or PyObjC will GC it
-_PANEL_W = 620
+_PANEL_W = 1080
 _PANEL_H = 720
 
 # Callbacks invoked when the user's custom preset list changes — the app
@@ -73,15 +74,18 @@ def _meeting_files():
     for f in files[:50]:
         try:
             raw = f.read_text()
+            parts = output.parse_meeting(f)
         except Exception:
             continue
-        # Filenames look like meeting_2026-06-10_1636_SEFI_-_ZF_Catchup.md
-        # — show the subject first and a friendly date/time underneath.
-        title, when = f.stem, ""
+        # The heading inside the file is the real title; the filename slug
+        # is the fallback. A friendly date/time renders underneath.
+        title = (parts.get("title") or "").strip()
+        when = ""
         m = re.match(r"meeting_(\d{4}-\d{2}-\d{2})_(\d{4})(?:_(.+))?$", f.stem)
         if m:
             date_s, time_s, slug = m.group(1), m.group(2), m.group(3) or ""
-            title = slug.replace("_", " ").strip() or "Meeting (no title)"
+            if not title:
+                title = slug.replace("_", " ").strip() or "Meeting (no title)"
             try:
                 dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H%M")
                 day = dt.strftime("%a %b %-d")
@@ -90,8 +94,15 @@ def _meeting_files():
                 when = day + dt.strftime(" · %-I:%M %p")
             except ValueError:
                 when = date_s
-        meetings.append({"title": title, "when": when,
-                         "filename": f.name, "content": raw})
+        meetings.append({
+            "title": title or f.stem,
+            "when": when,
+            "filename": f.name,
+            "summary_md": parts.get("summary_md", ""),
+            "notes_md": parts.get("notes_md", ""),
+            "transcript_md": parts.get("transcript_md", ""),
+            "content": raw,
+        })
     return meetings
 
 
@@ -435,15 +446,31 @@ def _act_resummarize_meeting(body):
                 path, parts["title"], parts["stamp"], summary_md,
                 parts["notes_md"], transcript)
             log.info("dashboard: re-summarized %s", name)
+            fresh = output.parse_meeting(path)
             _call_js("onResummarizeDone",
                      {"ok": True, "filename": name,
-                      "content": path.read_text()})
+                      "meeting": {
+                          "title": fresh.get("title", ""),
+                          "summary_md": fresh.get("summary_md", ""),
+                          "notes_md": fresh.get("notes_md", ""),
+                          "transcript_md": fresh.get("transcript_md", ""),
+                          "content": path.read_text(),
+                      }})
         except Exception as e:
             log.exception("dashboard: resummarize failed")
             _call_js("onResummarizeDone",
                      {"ok": False, "filename": name, "error": str(e)})
 
     threading.Thread(target=_work, daemon=True).start()
+
+
+def _act_record_meeting(body):
+    """Sidebar Record button — poke the app's trigger-file channel so the
+    normal meeting flow (preset, indicator, notes pad) takes over."""
+    try:
+        (config.app_dir() / "meeting_trigger").touch()
+    except Exception:
+        log.exception("dashboard: record trigger failed")
 
 
 def _act_open_meeting(body):
@@ -504,6 +531,7 @@ _ACTIONS = {
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
     "open_meeting": _act_open_meeting,
+    "record_meeting": _act_record_meeting,
     "resummarize_meeting": _act_resummarize_meeting,
     "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
@@ -531,844 +559,80 @@ def _push_state():
 
 
 # -- HTML / CSS / JS for the dashboard --------------------------------------
+# The UI lives in real files (dashboard_ui/style.css, app.js); this module
+# only assembles the skeleton and injects the boot data.
 
-# Plain strings (NOT f-strings) so CSS/JS braces don't need doubling.
-
-_EXTRA_CSS = """
-    .search-box {
-        width: 100%;
-        background: var(--surface);
-        border: 1px solid #444;
-        color: var(--text);
-        padding: 9px 12px;
-        border-radius: 8px;
-        font-size: 13px;
-        margin-bottom: 12px;
-        outline: none;
-    }
-    .search-box:focus { border-color: var(--accent); }
-    .card-title-block { flex: 1; min-width: 0; cursor: pointer; }
-    .card-title2 {
-        font-weight: 600;
-        font-size: 13px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-    .card-when { color: var(--text3); font-size: 11px; margin-top: 2px; }
-    .md-content {
-        padding: 4px 16px 16px;
-        font-size: 12.5px;
-        line-height: 1.65;
-        color: var(--text2);
-        -webkit-user-select: text;
-        user-select: text;
-    }
-    .md-content h2 { font-size: 14px; color: var(--text); margin: 14px 0 6px; }
-    .md-content h3 { font-size: 13px; color: var(--text); margin: 12px 0 5px; }
-    .md-content h4 { font-size: 12px; color: var(--text); margin: 10px 0 4px; }
-    .md-content p { margin: 6px 0; }
-    .md-content ul { margin: 6px 0 6px 18px; }
-    .md-content li { margin: 3px 0; }
-    .md-content hr { border: none; border-top: 1px solid #3a3a5a; margin: 12px 0; }
-    .md-content blockquote {
-        border-left: 3px solid var(--accent);
-        padding-left: 10px;
-        margin: 8px 0;
-    }
-    .md-content b { color: var(--text); }
-    .md-content code {
-        background: var(--bg);
-        padding: 1px 5px;
-        border-radius: 4px;
-        font-size: 11px;
-    }
-"""
-
-_MEETINGS_JS = """
-// ----- Meetings tab: rendered from the MEETINGS data, with search -------
-
-const _openMeetings = new Set();
-
-function mdToHtml(md) {
-    // Tiny markdown renderer for the formats save_meeting produces:
-    // headings, bold, bullets, blockquotes, --- rules, paragraphs.
-    const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
-                      .replace(/>/g, '&gt;');
-    const inline = s => s
-        .replace(/\\*\\*(.+?)\\*\\*/g, '<b>$1</b>')
-        .replace(/`([^`]+)`/g, '<code>$1</code>');
-    const out = [];
-    let para = [], inList = false;
-    const flushPara = () => {
-        if (para.length) { out.push('<p>' + para.join('<br>') + '</p>'); para = []; }
-    };
-    const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
-    for (const raw of md.split('\\n')) {
-        let t = inline(esc(raw)).trim();
-        if (!t) { flushPara(); closeList(); continue; }
-        if (/^---+$/.test(t)) { flushPara(); closeList(); out.push('<hr>'); continue; }
-        let m;
-        if ((m = t.match(/^(#{1,4})\\s+(.*)$/))) {
-            flushPara(); closeList();
-            const lvl = Math.min(m[1].length + 1, 4);
-            out.push('<h' + lvl + '>' + m[2] + '</h' + lvl + '>');
-            continue;
-        }
-        if ((m = t.match(/^[-*\\u2022]\\s+(.*)$/))) {
-            flushPara();
-            if (!inList) { out.push('<ul>'); inList = true; }
-            out.push('<li>' + m[1] + '</li>');
-            continue;
-        }
-        if ((m = t.match(/^&gt;\\s?(.*)$/))) {
-            flushPara(); closeList();
-            out.push('<blockquote>' + m[1] + '</blockquote>');
-            continue;
-        }
-        if (/^_.+_$/.test(t)) t = '<i>' + t.slice(1, -1) + '</i>';
-        para.push(t);
-    }
-    flushPara(); closeList();
-    return out.join('\\n');
-}
-
-function copyToClipboard(text, event) {
-    if (event) event.stopPropagation();
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    if (event && event.target && event.target.classList) {
-        const btn = event.target;
-        const orig = btn.textContent;
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
-        setTimeout(() => {
-            btn.textContent = orig;
-            btn.classList.remove('copied');
-        }, 1500);
-    }
-}
-
-function meetingBodyHtml(i) {
-    return '<div class="card-body-toolbar">' +
-        '<button class="copy-btn" onclick="copyMeetingIdx(' + i + ', event)">Copy</button>' +
-        '<button class="close-btn-inline" onclick="toggleCard(' + i + ')">&times; Close</button>' +
-        '</div><div class="md-content">' + mdToHtml(MEETINGS[i].content) + '</div>';
-}
-
-function copyMeetingIdx(i, event) { copyToClipboard(MEETINGS[i].content, event); }
-
-function toggleCard(i) {
-    const body = $('meeting-' + i);
-    const chev = $('chev-' + i);
-    if (!body) return;
-    if (body.classList.contains('open')) {
-        _openMeetings.delete(i);
-        body.classList.remove('open');
-        if (chev) chev.classList.remove('open');
-    } else {
-        _openMeetings.add(i);
-        if (!body.innerHTML) body.innerHTML = meetingBodyHtml(i);
-        body.classList.add('open');
-        if (chev) chev.classList.add('open');
-    }
-}
-
-// ----- Import-a-transcript panel ----------------------------------------
-
-function toggleImport() {
-    const p = $('import-panel');
-    const showing = p.style.display !== 'none';
-    p.style.display = showing ? 'none' : 'block';
-    if (!showing) $('import-text').focus();
-}
-
-function runImport() {
-    const text = $('import-text').value.trim();
-    const status = $('import-status');
-    if (!text) {
-        status.textContent = 'Paste some text first.';
-        return;
-    }
-    $('import-btn').disabled = true;
-    status.textContent = 'Summarizing — this can take a minute…';
-    send('import_transcript', {
-        text: text,
-        title: $('import-title').value.trim(),
-        preset: $('import-preset').value
-    });
-}
-
-window.onImportStage = function(p) {
-    $('import-status').textContent = p.stage || '';
-};
-
-window.onImportDone = function(p) {
-    $('import-btn').disabled = false;
-    const status = $('import-status');
-    if (p.ok) {
-        status.textContent = '✓ Saved — adding to your meetings…';
-        $('import-text').value = '';
-        $('import-title').value = '';
-    } else {
-        status.textContent = '✗ ' + (p.error || 'Failed — see the log.');
-    }
-};
-
-// ----- Re-summarize an existing meeting ---------------------------------
-
-function _resetRedoButtons() {
-    document.querySelectorAll('.redo-btn').forEach(b => {
-        b.disabled = false;
-        b.dataset.armed = '';
-        b.textContent = 'Redo';
-    });
-}
-
-window.onResummarizeStage = function(p) {
-    $('meeting-action-status').textContent = '↻ ' + (p.stage || 'Working…');
-};
-
-window.onResummarizeDone = function(p) {
-    const s = $('meeting-action-status');
-    _resetRedoButtons();
-    if (p.ok) {
-        // Patch the in-memory copy and re-render the card if it's open —
-        // no full reload, so search and scroll position are preserved.
-        const idx = MEETINGS.findIndex(m => m.filename === p.filename);
-        if (idx !== -1) {
-            MEETINGS[idx].content = p.content;
-            const body = $('meeting-' + idx);
-            if (body && body.classList.contains('open')) {
-                body.innerHTML = meetingBodyHtml(idx);
-            }
-        }
-        s.textContent = '✓ Summary updated for ' + p.filename;
-        setTimeout(() => { s.textContent = ''; }, 5000);
-    } else {
-        s.textContent = '✗ ' + (p.error || 'Re-summarize failed.');
-    }
-};
-
-function renderMeetings() {
-    const q = ($('meeting-search').value || '').trim().toLowerCase();
-    const list = $('meeting-list');
-    list.innerHTML = '';
-    let shown = 0;
-    MEETINGS.forEach((m, i) => {
-        if (q && !((m.title + ' ' + m.when + ' ' + m.content)
-                .toLowerCase().includes(q))) return;
-        shown++;
-
-        const card = document.createElement('div');
-        card.className = 'card';
-
-        const header = document.createElement('div');
-        header.className = 'card-header';
-
-        const tblock = document.createElement('div');
-        tblock.className = 'card-title-block';
-        const t1 = document.createElement('div');
-        t1.className = 'card-title2';
-        t1.textContent = m.title;
-        const t2 = document.createElement('div');
-        t2.className = 'card-when';
-        t2.textContent = m.when;
-        tblock.appendChild(t1);
-        tblock.appendChild(t2);
-        tblock.onclick = () => toggleCard(i);
-
-        const openBtn = document.createElement('button');
-        openBtn.className = 'copy-btn';
-        openBtn.textContent = 'Open';
-        openBtn.title = 'Open the file';
-        openBtn.onclick = (e) => { e.stopPropagation(); send('open_meeting', m.filename); };
-
-        // Redo Summary — re-runs the AI on the saved transcript. Two-click
-        // arm because it overwrites the current summary (WKWebView blocks
-        // confirm() dialogs, so we can't ask the normal way).
-        const redoBtn = document.createElement('button');
-        redoBtn.className = 'copy-btn redo-btn';
-        redoBtn.textContent = 'Redo';
-        redoBtn.title = 'Re-run the AI summary from the transcript';
-        redoBtn.onclick = (e) => {
-            e.stopPropagation();
-            if (redoBtn.dataset.armed) {
-                redoBtn.dataset.armed = '';
-                redoBtn.textContent = '…';
-                redoBtn.disabled = true;
-                send('resummarize_meeting', m.filename);
-            } else {
-                redoBtn.dataset.armed = '1';
-                redoBtn.textContent = 'Redo?';
-                setTimeout(() => {
-                    if (redoBtn.dataset.armed) {
-                        redoBtn.dataset.armed = '';
-                        redoBtn.textContent = 'Redo';
-                    }
-                }, 2500);
-            }
-        };
-
-        const copyBtn = document.createElement('button');
-        copyBtn.className = 'copy-btn';
-        copyBtn.textContent = 'Copy';
-        copyBtn.onclick = (e) => copyToClipboard(m.content, e);
-
-        const chev = document.createElement('span');
-        chev.className = 'chevron' + (_openMeetings.has(i) ? ' open' : '');
-        chev.id = 'chev-' + i;
-        chev.innerHTML = '&#9654;';
-        chev.onclick = () => toggleCard(i);
-
-        header.appendChild(tblock);
-        header.appendChild(openBtn);
-        header.appendChild(redoBtn);
-        header.appendChild(copyBtn);
-        header.appendChild(chev);
-
-        const body = document.createElement('div');
-        body.className = 'card-body' + (_openMeetings.has(i) ? ' open' : '');
-        body.id = 'meeting-' + i;
-        if (_openMeetings.has(i)) body.innerHTML = meetingBodyHtml(i);
-
-        card.appendChild(header);
-        card.appendChild(body);
-        list.appendChild(card);
-    });
-    if (!shown) {
-        list.innerHTML = '<p class="empty">' + (MEETINGS.length
-            ? 'No meetings match your search.'
-            : 'No meetings recorded yet.') + '</p>';
-    }
-}
-"""
+_UI_DIR = Path(__file__).resolve().parent / "dashboard_ui"
 
 
-def _build_html():
-    meetings = _meeting_files()
-    dictations = dictation_log.recent()
-    state = _state_snapshot()
+def _ui_asset(name):
+    return (_UI_DIR / name).read_text()
 
-    # The meetings list is rendered client-side (search + lazy expansion).
-    # "</" must be escaped or a literal "</script>" inside a transcript
-    # would terminate the script block.
-    meetings_json = json.dumps(meetings).replace("</", "<\\/")
 
-    dictations_html = ""
-    if not dictations:
-        dictations_html = '<p class="empty">No dictations yet. Use push-to-talk and they\'ll appear here.</p>'
-    else:
-        for i, d in enumerate(dictations):
-            safe_text = html.escape(d["text"])
-            dictations_html += f"""
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">{html.escape(d['timestamp'])}</span>
-                    <button class="copy-btn" onclick="copyText({i}, event)">Copy</button>
-                </div>
-                <div class="dict-text" id="dict-{i}">{safe_text}</div>
-            </div>"""
+_BODY = """
+<aside class="side">
+  <div class="side-top">
+    <div class="search">&#128269; <input id="side-search" type="text"
+         placeholder="Search everything&#8230;"></div>
+    <button class="close-app-btn" onclick="send('close_panel', null)"
+            title="Close">&#10005;</button>
+  </div>
+  <button class="record-btn" onclick="recordMeeting()">
+    <span class="dot"></span> <span id="record-btn-label">Record a meeting</span>
+  </button>
 
-    now = datetime.now().strftime("%I:%M %p")
-    state_json = json.dumps(state).replace("</", "<\\/")
+  <div class="nav-item active" data-view="meetings"><span class="ico">&#128203;</span> Meetings</div>
+  <div class="nav-item" data-view="dictation"><span class="ico">&#127908;</span> Dictation</div>
+  <div class="nav-item" data-view="import"><span class="ico">&#128229;</span> Import</div>
+  <div class="nav-item" data-view="settings"><span class="ico">&#9881;&#65039;</span> Settings</div>
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>MyWhisper</title>
-<style>
-    :root {{
-        --bg: #1a1a2e;
-        --surface: #222244;
-        --surface2: #2a2a4a;
-        --surface3: #303050;
-        --accent: #e94560;
-        --accent2: #0f3460;
-        --text: #eee;
-        --text2: #aaa;
-        --text3: #777;
-        --green: #4ecca3;
-        --red: #e94560;
-        --radius: 10px;
-    }}
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-        background: var(--bg);
-        color: var(--text);
-        -webkit-user-select: none;
-        user-select: none;
-    }}
-    .header {{
-        background: linear-gradient(135deg, var(--accent2), #16213e);
-        padding: 18px 20px 12px;
-        border-bottom: 2px solid var(--accent);
-        -webkit-app-region: drag;
-        position: relative;
-    }}
-    .close-btn {{
-        position: absolute;
-        top: 12px;
-        right: 14px;
-        width: 26px;
-        height: 26px;
-        border: none;
-        background: rgba(255, 255, 255, 0.10);
-        color: var(--text);
-        font-size: 13px;
-        font-weight: 600;
-        line-height: 1;
-        border-radius: 13px;
-        cursor: pointer;
-        -webkit-app-region: no-drag;
-        transition: all 0.15s;
-    }}
-    .close-btn:hover {{
-        background: var(--accent);
-        color: white;
-    }}
-    .header h1 {{ font-size: 18px; font-weight: 600; }}
-    .header h1 span {{ color: var(--accent); }}
-    .header .updated {{
-        font-size: 11px;
-        color: var(--text2);
-        margin-top: 3px;
-    }}
-    .tabs {{
-        display: flex;
-        background: var(--surface);
-        border-bottom: 1px solid #333;
-    }}
-    .tab {{
-        flex: 1;
-        padding: 12px 0;
-        text-align: center;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 500;
-        color: var(--text2);
-        transition: all 0.2s;
-        border-bottom: 3px solid transparent;
-    }}
-    .tab:hover {{ color: var(--text); background: var(--surface2); }}
-    .tab.active {{
-        color: var(--accent);
-        border-bottom-color: var(--accent);
-    }}
-    .tab-count {{
-        display: inline-block;
-        background: var(--accent2);
-        color: var(--text2);
-        font-size: 10px;
-        padding: 1px 6px;
-        border-radius: 8px;
-        margin-left: 5px;
-    }}
-    .tab.active .tab-count {{
-        background: var(--accent);
-        color: white;
-    }}
-    .scroll-area {{
-        overflow-y: auto;
-        max-height: calc(100vh - 110px);
-        padding: 14px 16px 24px;
-    }}
-    .content {{ display: none; }}
-    .content.active {{ display: block; }}
-    .card {{
-        background: var(--surface);
-        border-radius: var(--radius);
-        margin-bottom: 10px;
-        overflow: hidden;
-        border: 1px solid #333;
-    }}
-    .card:hover {{ border-color: #555; }}
-    .card-header {{
-        display: flex;
-        align-items: center;
-        padding: 12px 14px;
-        cursor: pointer;
-        gap: 10px;
-    }}
-    .card-title {{ font-weight: 500; font-size: 13px; flex-shrink: 0; }}
-    .card-file {{
-        color: var(--text2);
-        font-size: 11px;
-        flex: 1;
-        text-align: right;
-    }}
-    .chevron {{
-        color: var(--text2);
-        font-size: 11px;
-        transition: transform 0.2s;
-    }}
-    .chevron.open {{ transform: rotate(90deg); }}
-    .card-body {{
-        display: none;
-        max-height: 380px;
-        overflow-y: auto;
-        position: relative;
-    }}
-    .card-body.open {{ display: block; }}
-    .card-body-toolbar {{
-        position: sticky;
-        top: 0;
-        z-index: 2;
-        display: flex;
-        gap: 6px;
-        justify-content: flex-end;
-        padding: 8px 14px;
-        background: linear-gradient(to bottom,
-            var(--surface) 0%,
-            var(--surface) 85%,
-            rgba(34, 34, 68, 0) 100%);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }}
-    .card-body-content {{
-        padding: 4px 14px 14px;
-        margin: 0;
-        font-size: 12px;
-        line-height: 1.6;
-        color: var(--text2);
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        font-family: inherit;
-        -webkit-user-select: text;
-        user-select: text;
-    }}
-    .close-btn-inline {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px solid #555;
-        padding: 5px 11px;
-        border-radius: 6px;
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s;
-    }}
-    .close-btn-inline:hover {{
-        background: var(--surface2);
-        color: var(--text);
-        border-color: #777;
-    }}
-    .dict-text {{
-        padding: 0 14px 12px;
-        font-size: 13px;
-        line-height: 1.5;
-        -webkit-user-select: text;
-        user-select: text;
-    }}
-    .copy-btn, .btn {{
-        background: var(--accent2);
-        color: var(--text);
-        border: 1px solid #444;
-        padding: 6px 14px;
-        border-radius: 6px;
-        font-size: 12px;
-        cursor: pointer;
-        transition: all 0.15s;
-        flex-shrink: 0;
-    }}
-    .btn:hover, .copy-btn:hover {{
-        background: var(--accent);
-        border-color: var(--accent);
-    }}
-    .copy-btn.copied {{
-        background: var(--green);
-        border-color: var(--green);
-        color: #111;
-    }}
-    .empty {{
-        text-align: center;
-        color: var(--text2);
-        padding: 50px 16px;
-        font-size: 14px;
-    }}
+  <div class="group-label">RECENT</div>
+  <div class="meeting-list" id="side-list"></div>
+  <div class="side-foot">&#127908; MyWhisper &#8212; everything on your Mac</div>
+</aside>
 
-    /* ----- Settings ----- */
-    .settings-section {{
-        background: var(--surface);
-        border-radius: var(--radius);
-        padding: 16px 18px;
-        margin-bottom: 14px;
-        border: 1px solid #333;
-    }}
-    .settings-section h3 {{
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--accent);
-        margin-bottom: 4px;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-    }}
-    .settings-section .section-desc {{
-        font-size: 11px;
-        color: var(--text3);
-        margin-bottom: 14px;
-    }}
-    .field {{ margin-bottom: 14px; }}
-    .field:last-child {{ margin-bottom: 0; }}
-    .field-label {{
-        display: block;
-        font-size: 12px;
-        color: var(--text2);
-        margin-bottom: 6px;
-        font-weight: 500;
-    }}
-    .field-hint {{
-        font-size: 10px;
-        color: var(--text3);
-        margin-top: 4px;
-    }}
-    .field-row {{
-        display: flex;
-        gap: 8px;
-        align-items: center;
-    }}
-    input[type=text], input[type=password], select, textarea {{
-        background: var(--bg);
-        color: var(--text);
-        border: 1px solid #444;
-        padding: 7px 10px;
-        border-radius: 6px;
-        font-size: 12px;
-        font-family: inherit;
-        width: 100%;
-        outline: none;
-    }}
-    input[type=text]:focus, input[type=password]:focus,
-    select:focus, textarea:focus {{
-        border-color: var(--accent);
-    }}
-    select {{
-        cursor: pointer;
-        appearance: none;
-        -webkit-appearance: none;
-        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><polygon points='0,0 10,0 5,6' fill='%23aaa'/></svg>");
-        background-repeat: no-repeat;
-        background-position: right 10px center;
-        background-size: 10px 6px;
-        padding-right: 28px;
-    }}
-    textarea {{
-        min-height: 110px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 11px;
-        line-height: 1.5;
-        resize: vertical;
-    }}
-    .folder-display {{
-        background: var(--bg);
-        border: 1px solid #444;
-        padding: 7px 10px;
-        border-radius: 6px;
-        font-size: 11px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        color: var(--text2);
-        flex: 1;
-        overflow-x: auto;
-        white-space: nowrap;
-    }}
-    .toggle {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        cursor: pointer;
-    }}
-    .toggle input {{ accent-color: var(--accent); }}
-    .toggle-label {{ font-size: 12px; color: var(--text); }}
-    .pill-status {{
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 10px;
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.4px;
-        margin-left: 6px;
-    }}
-    .pill-status.ok {{ background: var(--green); color: #111; }}
-    .pill-status.missing {{ background: var(--red); color: white; }}
-    #test-result {{
-        font-size: 11px;
-        margin-top: 8px;
-        min-height: 16px;
-    }}
-    #test-result.ok {{ color: var(--green); }}
-    #test-result.err {{ color: var(--red); }}
-    .preset-group-label {{
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-        color: var(--text3);
-        margin-bottom: 4px;
-        font-weight: 600;
-    }}
-    .preset-row {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        background: var(--bg);
-        border: 1px solid #444;
-        border-radius: 6px;
-        padding: 8px 10px;
-        margin-bottom: 4px;
-        transition: all 0.15s;
-    }}
-    .preset-row:hover {{ border-color: #666; }}
-    .preset-row.selected {{
-        border-color: var(--accent);
-        background: var(--surface2);
-    }}
-    .preset-row .preset-pick {{
-        flex: 1;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }}
-    .preset-row .preset-radio {{
-        width: 14px;
-        height: 14px;
-        border-radius: 7px;
-        border: 1.5px solid #666;
-        flex-shrink: 0;
-        background: transparent;
-    }}
-    .preset-row.selected .preset-radio {{
-        background: var(--accent);
-        border-color: var(--accent);
-        box-shadow: inset 0 0 0 2px var(--bg);
-    }}
-    .preset-row .preset-label {{
-        font-size: 12px;
-        font-weight: 500;
-    }}
-    .preset-row .preset-actions {{
-        display: flex;
-        gap: 4px;
-    }}
-    .preset-row .icon-btn {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px solid transparent;
-        padding: 3px 7px;
-        border-radius: 4px;
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s;
-    }}
-    .preset-row .icon-btn:hover {{
-        background: var(--surface2);
-        color: var(--text);
-        border-color: #555;
-    }}
-    .preset-row .icon-btn.delete:hover {{
-        color: var(--red);
-        border-color: var(--red);
-    }}
-    .btn-ghost {{
-        background: transparent;
-        border: 1px solid #444;
-    }}
-    .btn-ghost:hover {{
-        background: var(--surface2);
-        border-color: #555;
-    }}
-    .starter-btn {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px dashed #555;
-        padding: 4px 10px;
-        border-radius: 12px;
-        font-size: 11px;
-        cursor: pointer;
-        margin: 0 2px;
-        transition: all 0.15s;
-    }}
-    .starter-btn:hover {{
-        border-color: var(--accent);
-        color: var(--text);
-    }}
-{_EXTRA_CSS}
-</style>
-</head>
-<body>
+<main class="main">
+  <div class="card">
 
-<div class="header">
-    <button class="close-btn" onclick="send('close_panel', null)" title="Close">&#10005;</button>
-    <h1>&#127908; <span>MyWhisper</span></h1>
-    <div class="updated">Updated {now}</div>
-</div>
+    <div class="view active" id="view-meetings"></div>
 
-<div class="tabs">
-    <div class="tab active" data-tab="meetings" onclick="switchTab('meetings')">
-        Meetings <span class="tab-count">{len(meetings)}</span>
-    </div>
-    <div class="tab" data-tab="dictation" onclick="switchTab('dictation')">
-        Dictation <span class="tab-count">{len(dictations)}</span>
-    </div>
-    <div class="tab" data-tab="settings" onclick="switchTab('settings')">
-        Settings
-    </div>
-</div>
-
-<div class="scroll-area">
-
-<div class="content active" id="meetings-content">
-    <div class="field-row" style="margin-bottom: 12px;">
-        <input type="text" id="meeting-search" class="search-box"
-               placeholder="Search meetings — titles, people, anything said…"
-               style="margin-bottom: 0; flex: 1;"
-               oninput="renderMeetings()">
-        <button class="btn btn-ghost" onclick="toggleImport()"
-                title="Paste a transcript from Voice Memos, Teams, etc.">+ Import</button>
+    <div class="view" id="view-dictation">
+      <div class="view-h1">Dictation history</div>
+      <div class="view-sub">Your recent dictations &#8212; click Copy to reuse one.</div>
+      <div id="dict-list"></div>
     </div>
 
-    <div class="settings-section" id="import-panel" style="display: none;">
-        <h3>Import a Transcript</h3>
-        <div class="section-desc">Paste text from your iPhone's Voice Memos,
-        a Teams transcript, or rough notes — MyWhisper summarizes it and
-        files it with your other meetings.</div>
-        <div class="field">
-            <input type="text" id="import-title"
-                   placeholder="Title (optional — the AI picks one if blank)">
-        </div>
-        <div class="field">
-            <label class="field-label">Meeting type</label>
-            <select id="import-preset"></select>
-        </div>
-        <div class="field">
-            <textarea id="import-text" style="min-height: 150px;"
-                placeholder="Paste the transcript here…"></textarea>
-        </div>
-        <div class="field-row">
-            <button class="btn" id="import-btn" onclick="runImport()">Summarize &amp; Save</button>
-            <button class="btn btn-ghost" onclick="toggleImport()">Cancel</button>
-            <span id="import-status" class="field-hint"></span>
-        </div>
+    <div class="view" id="view-import">
+      <div class="view-h1">Import a transcript</div>
+      <div class="view-sub">Paste text from your iPhone's Voice Memos, a Teams
+        transcript, or rough notes &#8212; MyWhisper summarizes it and files it
+        with your other meetings.</div>
+      <div class="field">
+        <input type="text" id="import-title"
+               placeholder="Title (optional &#8212; the AI picks one if blank)">
+      </div>
+      <div class="field">
+        <label class="field-label">Meeting type</label>
+        <select id="import-preset"></select>
+      </div>
+      <div class="field">
+        <textarea id="import-text" style="min-height: 180px;"
+                  placeholder="Paste the transcript here&#8230;"></textarea>
+      </div>
+      <div class="field-row">
+        <button class="btn primary" id="import-btn" onclick="runImport()">Summarize &amp; Save</button>
+        <span id="import-status" class="field-hint"></span>
+      </div>
     </div>
 
-    <div id="meeting-action-status" class="field-hint" style="min-height: 14px; margin-bottom: 8px;"></div>
-    <div id="meeting-list"></div>
-</div>
+    <div class="view" id="view-settings">
+      <div class="view-h1">Settings</div>
+      <div class="view-sub">Presets, AI backend, vocabulary, microphone, and system options.</div>
 
-<div class="content" id="dictation-content">
-    {dictations_html}
-</div>
-
-<div class="content" id="settings-content">
-
-    <!-- 1. Meeting Type Presets — most frequently changed -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Meeting Type Presets</h3>
-        <div class="section-desc">Pick the default below — you can choose a different one each time from the Start Meeting submenu.</div>
+        <div class="section-desc">Pick the default below &#8212; you can choose a
+          different one each time from the Start Meeting submenu.</div>
 
         <div class="preset-group-label">Built-in</div>
         <div id="builtin-list"></div>
@@ -1377,569 +641,177 @@ def _build_html():
         <div id="custom-list"></div>
 
         <div id="add-row" style="margin-top: 8px;">
-            <button class="btn" onclick="startNewPreset()">+ Add Custom Preset</button>
-            <span class="field-hint" style="margin-left: 10px;">Or use a starter:</span>
-            <span id="starter-buttons"></span>
+          <button class="btn" onclick="startNewPreset()">+ Add Custom Preset</button>
+          <span class="field-hint" style="margin-left: 10px;">Or use a starter:</span>
+          <span id="starter-buttons"></span>
         </div>
 
-        <div id="preset-editor" style="display: none; margin-top: 14px; padding: 14px; background: var(--bg); border: 1px solid #444; border-radius: 8px;">
-            <div class="field">
-                <label class="field-label">Preset Name</label>
-                <input type="text" id="editor-label" placeholder="e.g. Board Meeting, Vendor Call">
-            </div>
-            <div class="field">
-                <label class="field-label">What should the AI focus on?</label>
-                <textarea id="editor-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
-                <div class="field-hint">Plain English — describe what matters most. The AI will lean into this when writing the summary.</div>
-            </div>
-            <div class="field-row">
-                <button class="btn" onclick="savePresetEdit()" id="editor-save-btn">Save</button>
-                <button class="btn btn-ghost" onclick="cancelPresetEdit()">Cancel</button>
-                <span id="editor-status" class="field-hint"></span>
-            </div>
+        <div id="preset-editor" style="display: none; margin-top: 14px;
+             padding: 14px; border: 1px solid var(--line); border-radius: 8px;">
+          <div class="field">
+            <label class="field-label">Preset Name</label>
+            <input type="text" id="editor-label" placeholder="e.g. Board Meeting, Vendor Call">
+          </div>
+          <div class="field">
+            <label class="field-label">What should the AI focus on?</label>
+            <textarea id="editor-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
+            <div class="field-hint">Plain English &#8212; describe what matters most. The AI will lean into this when writing the summary.</div>
+          </div>
+          <div class="field-row">
+            <button class="btn primary" onclick="savePresetEdit()" id="editor-save-btn">Save</button>
+            <button class="btn" onclick="cancelPresetEdit()">Cancel</button>
+            <span id="editor-status" class="field-hint"></span>
+          </div>
         </div>
-    </div>
+      </div>
 
-    <!-- 2. LLM — provider/key/model -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>LLM (for Meeting Summaries)</h3>
-        <div class="section-desc">Which cloud model writes your meeting notes.</div>
+        <div class="section-desc">Which AI writes your meeting notes.</div>
 
         <div class="field">
-            <label class="field-label">Provider</label>
-            <select id="provider-select" onchange="send('set_provider', this.value)"></select>
+          <label class="field-label">Provider</label>
+          <select id="provider-select" onchange="send('set_provider', this.value)"></select>
         </div>
 
         <div class="field" id="custom-url-row" style="display: none;">
-            <label class="field-label">
-                Server URL <span id="url-status" class="pill-status"></span>
-            </label>
-            <div class="field-row">
-                <input type="text" id="custom-url-input" placeholder="e.g. http://llm.local:11434">
-                <button class="btn" onclick="saveCustomUrl()">Save</button>
-            </div>
-            <div class="field-hint">Ollama, LM Studio, llama.cpp server, etc. — MyWhisper auto-detects the API style.</div>
+          <label class="field-label">
+            Server URL <span id="url-status" class="pill-status"></span>
+          </label>
+          <div class="field-row">
+            <input type="text" id="custom-url-input" placeholder="e.g. http://llm.local:11434">
+            <button class="btn" onclick="saveCustomUrl()">Save</button>
+          </div>
+          <div class="field-hint">Ollama, LM Studio, llama.cpp server, etc. &#8212; MyWhisper auto-detects the API style.</div>
         </div>
 
         <div class="field" id="api-key-row">
-            <label class="field-label" id="api-key-label">API Key <span id="key-status" class="pill-status"></span></label>
-            <div class="field-row">
-                <input type="password" id="api-key-input" placeholder="Paste your key…">
-                <button class="btn" onclick="saveApiKey()">Save</button>
-            </div>
-            <div class="field-hint" id="api-key-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
+          <label class="field-label" id="api-key-label">API Key <span id="key-status" class="pill-status"></span></label>
+          <div class="field-row">
+            <input type="password" id="api-key-input" placeholder="Paste your key&#8230;">
+            <button class="btn" onclick="saveApiKey()">Save</button>
+          </div>
+          <div class="field-hint" id="api-key-hint">Stored securely in macOS Keychain &#8212; never written to disk in plain text.</div>
         </div>
 
         <div class="field">
-            <label class="field-label">
-                Model
-                <span id="model-status" class="field-hint" style="margin-left: 6px;"></span>
-            </label>
-            <div class="field-row">
-                <select id="model-select" onchange="onModelPicked()" style="flex: 1;">
-                    <option value="">Loading models…</option>
-                </select>
-                <button class="btn btn-ghost" onclick="refreshModels()" title="Reload list from provider">↻</button>
-            </div>
-            <div class="field-hint">List comes straight from the provider. Pick "Other…" to type a model name manually.</div>
+          <label class="field-label">
+            Model
+            <span id="model-status" class="field-hint" style="margin-left: 6px;"></span>
+          </label>
+          <div class="field-row">
+            <select id="model-select" onchange="onModelPicked()" style="flex: 1;">
+              <option value="">Loading models&#8230;</option>
+            </select>
+            <button class="btn" onclick="refreshModels()" title="Reload list from provider">&#8635;</button>
+          </div>
+          <div class="field-hint">List comes straight from the provider. Pick "Other&#8230;" to type a model name manually.</div>
         </div>
 
         <div class="field" id="model-manual-row" style="display: none;">
-            <label class="field-label">Custom Model ID</label>
-            <div class="field-row">
-                <input type="text" id="model-input" placeholder="exact model identifier">
-                <button class="btn" onclick="saveModel()">Save</button>
-            </div>
+          <label class="field-label">Custom Model ID</label>
+          <div class="field-row">
+            <input type="text" id="model-input" placeholder="exact model identifier">
+            <button class="btn" onclick="saveModel()">Save</button>
+          </div>
         </div>
 
         <div class="field">
-            <button class="btn" onclick="testLLM()">Test Connection</button>
-            <div id="test-result"></div>
+          <button class="btn" onclick="testLLM()">Test Connection</button>
+          <div id="test-result"></div>
         </div>
-    </div>
+      </div>
 
-    <!-- 3. Vocabulary — occasionally edited -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Vocabulary</h3>
-        <div class="section-desc">Custom terms — one per line. Whisper uses these as a hint so it gets names and abbreviations right.</div>
-        <textarea id="vocab-text" placeholder="# One term per line — company names, initials, jargon."></textarea>
+        <div class="section-desc">Custom terms &#8212; one per line. Whisper uses
+          these as a hint so it gets names and abbreviations right.</div>
+        <textarea id="vocab-text" placeholder="# One term per line &#8212; company names, initials, jargon."></textarea>
         <div class="field-row" style="margin-top: 8px;">
-            <button class="btn" onclick="saveVocab()">Save Vocabulary</button>
-            <span id="vocab-status" class="field-hint"></span>
+          <button class="btn primary" onclick="saveVocab()">Save Vocabulary</button>
+          <span id="vocab-status" class="field-hint"></span>
         </div>
-    </div>
+      </div>
 
-    <!-- 4. Microphone & Visualization — set once usually -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Microphone &amp; Visualization</h3>
 
         <div class="field">
-            <label class="field-label">Input Device</label>
-            <select id="mic-select" onchange="send('set_mic', this.value)"></select>
+          <label class="field-label">Input Device</label>
+          <select id="mic-select" onchange="send('set_mic', this.value)"></select>
         </div>
 
         <div class="field">
-            <label class="field-label">Live Indicator Style</label>
-            <select id="viz-select" onchange="send('set_visualization', this.value)">
-                <option value="waveform">Waveform</option>
-                <option value="vu_meter">VU Meter (Retro)</option>
-            </select>
+          <label class="field-label">Live Indicator Style</label>
+          <select id="viz-select" onchange="send('set_visualization', this.value)">
+            <option value="waveform">Waveform</option>
+            <option value="vu_meter">VU Meter (Retro)</option>
+          </select>
         </div>
-    </div>
+      </div>
 
-    <!-- 5. System Audio (for Meeting Recording) -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>System Audio (for Meeting Recording)</h3>
-        <div class="section-desc">macOS gates capture of the other side of your Zoom/Teams calls behind Screen Recording permission. Grant it once and meeting recordings include everyone's audio, not just your microphone.</div>
+        <div class="section-desc">macOS gates capture of the other side of your
+          Zoom/Teams calls behind Screen Recording permission. Grant it once and
+          meeting recordings include everyone's audio, not just your microphone.</div>
 
         <div class="field">
-            <label class="field-label">
-                Screen Recording <span id="sr-status" class="pill-status"></span>
-            </label>
-            <div class="field-row">
-                <button class="btn" onclick="send('request_screen_recording', null)">Request / Test</button>
-                <button class="btn btn-ghost" onclick="send('open_screen_recording_settings', null)">Open System Settings</button>
-            </div>
-            <div class="field-hint" id="sr-hint"></div>
+          <label class="field-label">
+            Screen Recording <span id="sr-status" class="pill-status"></span>
+          </label>
+          <div class="field-row">
+            <button class="btn" onclick="send('request_screen_recording', null)">Request / Test</button>
+            <button class="btn" onclick="send('open_screen_recording_settings', null)">Open System Settings</button>
+          </div>
+          <div class="field-hint" id="sr-hint"></div>
         </div>
-    </div>
+      </div>
 
-    <!-- 6. System — set once -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>System</h3>
         <label class="toggle">
-            <input type="checkbox" id="autostart-toggle" onchange="send('set_autostart', this.checked)">
-            <span class="toggle-label">Start MyWhisper automatically at login</span>
+          <input type="checkbox" id="autostart-toggle" onchange="send('set_autostart', this.checked)">
+          <span class="toggle-label">Start MyWhisper automatically at login</span>
         </label>
-    </div>
+      </div>
 
-    <!-- 6. Data Folder — advanced, rarely changed -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Data Folder</h3>
-        <div class="section-desc">Where recordings, transcripts, and your config are stored. Set once.</div>
+        <div class="section-desc">Where recordings, transcripts, and your config
+          are stored. Set once.</div>
         <div class="field-row">
-            <div class="folder-display" id="folder-display"></div>
-            <button class="btn" onclick="pickFolder()">Change…</button>
+          <div class="folder-display" id="folder-display"></div>
+          <button class="btn" onclick="pickFolder()">Change&#8230;</button>
         </div>
         <div class="field-hint">Changing the folder copies your existing files to the new spot.</div>
+      </div>
+
     </div>
 
-</div>
+  </div>
+</main>
+"""
 
-</div>
 
-<script>
-const initialState = {state_json};
-const MEETINGS = {meetings_json};
-
-function $(id) {{ return document.getElementById(id); }}
-
-function send(action, value) {{
-    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {{
-        window.webkit.messageHandlers.bridge.postMessage({{ action: action, value: value }});
-    }}
-}}
-
-function switchTab(name) {{
-    document.querySelectorAll('.tab').forEach(t => {{
-        t.classList.toggle('active', t.dataset.tab === name);
-    }});
-    document.querySelectorAll('.content').forEach(c => {{
-        c.classList.toggle('active', c.id === name + '-content');
-    }});
-}}
-
-function copyText(i, event) {{
-    copyToClipboard($('dict-' + i).innerText, event);
-}}
-
-{_MEETINGS_JS}
-
-function saveApiKey() {{
-    const v = $('api-key-input').value.trim();
-    if (v && !v.includes('•')) send('set_api_key', v);
-    $('api-key-input').value = '';
-}}
-
-function saveCustomUrl() {{
-    send('set_custom_url', $('custom-url-input').value.trim());
-}}
-
-function saveModel() {{
-    send('set_model', $('model-input').value.trim());
-}}
-
-function saveVocab() {{
-    send('save_vocab', $('vocab-text').value);
-    const s = $('vocab-status');
-    s.textContent = 'Saved.';
-    setTimeout(() => s.textContent = '', 2000);
-}}
-
-function pickFolder() {{ send('pick_folder', null); }}
-
-function testLLM() {{
-    const r = $('test-result');
-    r.className = '';
-    r.textContent = 'Testing…';
-    send('test_llm', null);
-}}
-
-window.onTestResult = function(payload) {{
-    const r = $('test-result');
-    if (payload.ok) {{
-        r.className = 'ok';
-        r.textContent = '✓ Connected to ' + payload.message;
-    }} else {{
-        r.className = 'err';
-        r.textContent = '✗ ' + payload.message;
-    }}
-}};
-
-window.onState = function(state) {{ renderState(state); }};
-
-function renderState(s) {{
-    $('folder-display').textContent = s.data_dir;
-
-    // Provider dropdown
-    const psel = $('provider-select');
-    psel.innerHTML = '';
-    s.llm_providers.forEach(p => {{
-        const o = document.createElement('option');
-        o.value = p.id;
-        o.textContent = p.label;
-        if (p.id === s.llm_provider) o.selected = true;
-        psel.appendChild(o);
-    }});
-
-    // Provider-specific rows: URL shows only for providers that use one;
-    // the key row shows whenever the provider has a key_name (required
-    // OR optional).
-    $('api-key-row').style.display = s.llm_needs_key ? 'block' : 'none';
-    $('custom-url-row').style.display = s.llm_needs_url ? 'block' : 'none';
-
-    // URL status
-    if (s.llm_needs_url) {{
-        $('custom-url-input').value = s.custom_llm_url || '';
-        const urlPill = $('url-status');
-        if (s.custom_llm_url) {{
-            urlPill.className = 'pill-status ok';
-            urlPill.textContent = 'Set';
-        }} else {{
-            urlPill.className = 'pill-status missing';
-            urlPill.textContent = 'Not set';
-        }}
-    }}
-
-    // API key field label & status pill
-    const keyLabel = $('api-key-label');
-    const pill = $('key-status');
-    const keyHint = $('api-key-hint');
-    if (s.llm_key_optional) {{
-        keyLabel.firstChild.textContent = 'Auth Token (optional) ';
-        keyHint.textContent = 'Most local LLM servers do not need this. Set only if your server requires Bearer authentication.';
-        if (s.api_key_set) {{
-            pill.className = 'pill-status ok';
-            pill.textContent = 'Set';
-            $('api-key-input').placeholder = s.api_key_masked || 'Saved';
-        }} else {{
-            pill.className = '';
-            pill.textContent = '';
-            $('api-key-input').placeholder = 'No auth needed for most servers';
-        }}
-    }} else {{
-        keyLabel.firstChild.textContent = 'API Key ';
-        keyHint.textContent = 'Stored securely in macOS Keychain — never written to disk in plain text.';
-        if (s.api_key_set) {{
-            pill.className = 'pill-status ok';
-            pill.textContent = 'Set';
-            $('api-key-input').placeholder = s.api_key_masked || 'Saved — paste a new key to replace';
-        }} else {{
-            pill.className = 'pill-status missing';
-            pill.textContent = 'Not set';
-            $('api-key-input').placeholder = 'Paste your key…';
-        }}
-    }}
-
-    // Model dropdown is populated asynchronously by refreshModels();
-    // keep the manual text field in sync with the current saved model.
-    $('model-input').value = s.llm_model || '';
-    syncModelDropdown(s.llm_model || '');
-
-    // Mic dropdown
-    const msel = $('mic-select');
-    msel.innerHTML = '';
-    const def = document.createElement('option');
-    def.value = '';
-    def.textContent = 'System Default';
-    if (!s.mic) def.selected = true;
-    msel.appendChild(def);
-    s.mic_devices.forEach(name => {{
-        const o = document.createElement('option');
-        o.value = name;
-        o.textContent = name;
-        if (name === s.mic) o.selected = true;
-        msel.appendChild(o);
-    }});
-
-    $('viz-select').value = s.visualization;
-    $('autostart-toggle').checked = s.autostart;
-
-    // Screen Recording permission status
-    const srPill = $('sr-status');
-    const srHint = $('sr-hint');
-    if (s.screen_recording_granted) {{
-        srPill.className = 'pill-status ok';
-        srPill.textContent = 'Granted';
-        srHint.textContent = 'Both sides of your calls will be captured. ✓';
-    }} else {{
-        srPill.className = 'pill-status missing';
-        srPill.textContent = 'Not granted';
-        srHint.textContent = 'Click Request/Test to trigger the macOS prompt. If you previously denied, that prompt won\\'t show again — use Open System Settings to flip it on manually (under Screen Recording → python3.12).';
-    }}
-    $('vocab-text').value = s.vocabulary;
-
-    // Built-in presets — picker only (no edit/delete)
-    const bi = $('builtin-list');
-    bi.innerHTML = '';
-    s.builtin_presets.forEach(p => renderPresetRow(bi, p, s.meeting_preset, false));
-
-    // Custom presets — picker + edit + delete
-    const cu = $('custom-list');
-    cu.innerHTML = '';
-    if (!s.custom_presets || s.custom_presets.length === 0) {{
-        const empty = document.createElement('div');
-        empty.className = 'field-hint';
-        empty.style.padding = '8px 0';
-        empty.textContent = 'No custom presets yet. Add one below.';
-        cu.appendChild(empty);
-    }} else {{
-        s.custom_presets.forEach(p => renderPresetRow(cu, p, s.meeting_preset, true));
-    }}
-
-    // Import-panel meeting-type dropdown (built-in + custom presets)
-    const isel = $('import-preset');
-    if (isel) {{
-        const prev = isel.value;
-        isel.innerHTML = '';
-        const addOpt = (p) => {{
-            const o = document.createElement('option');
-            o.value = p.id;
-            o.textContent = p.label;
-            if (p.id === (prev || s.meeting_preset)) o.selected = true;
-            isel.appendChild(o);
-        }};
-        s.builtin_presets.forEach(addOpt);
-        (s.custom_presets || []).forEach(addOpt);
-    }}
-
-    // Starter quick-add buttons
-    const sb = $('starter-buttons');
-    sb.innerHTML = '';
-    (s.starter_presets || []).forEach(starter => {{
-        const btn = document.createElement('button');
-        btn.className = 'starter-btn';
-        btn.textContent = '+ ' + starter.label;
-        btn.onclick = () => send('add_custom_preset', {{
-            label: starter.label, focus: starter.focus
-        }});
-        sb.appendChild(btn);
-    }});
-}}
-
-function renderPresetRow(container, preset, selectedId, editable) {{
-    const row = document.createElement('div');
-    row.className = 'preset-row' + (preset.id === selectedId ? ' selected' : '');
-
-    const pick = document.createElement('div');
-    pick.className = 'preset-pick';
-    pick.innerHTML = '<div class="preset-radio"></div>' +
-                     '<div class="preset-label">' + escapeHtml(preset.label) + '</div>';
-    pick.onclick = () => send('set_preset', preset.id);
-    row.appendChild(pick);
-
-    if (editable) {{
-        const actions = document.createElement('div');
-        actions.className = 'preset-actions';
-        const editBtn = document.createElement('button');
-        editBtn.className = 'icon-btn';
-        editBtn.textContent = 'Edit';
-        editBtn.onclick = (e) => {{ e.stopPropagation(); openEditPreset(preset); }};
-        const delBtn = document.createElement('button');
-        delBtn.className = 'icon-btn delete';
-        delBtn.textContent = 'Delete';
-        // No confirm() here — WKWebView suppresses JS dialogs, so it
-        // would silently answer "no". Two-click confirm instead.
-        delBtn.onclick = (e) => {{
-            e.stopPropagation();
-            if (delBtn.dataset.armed) {{
-                send('delete_custom_preset', {{ id: preset.id }});
-            }} else {{
-                delBtn.dataset.armed = '1';
-                delBtn.textContent = 'Click again to delete';
-                setTimeout(() => {{
-                    delBtn.dataset.armed = '';
-                    delBtn.textContent = 'Delete';
-                }}, 2500);
-            }}
-        }};
-        actions.appendChild(editBtn);
-        actions.appendChild(delBtn);
-        row.appendChild(actions);
-    }}
-    container.appendChild(row);
-}}
-
-function escapeHtml(s) {{
-    return String(s || '').replace(/[&<>\"']/g, c => ({{
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }}[c]));
-}}
-
-let _editingId = null;
-
-function startNewPreset() {{
-    _editingId = null;
-    $('editor-label').value = '';
-    $('editor-focus').value = '';
-    $('editor-save-btn').textContent = 'Add Preset';
-    $('preset-editor').style.display = 'block';
-    $('editor-label').focus();
-}}
-
-function openEditPreset(preset) {{
-    _editingId = preset.id;
-    $('editor-label').value = preset.label;
-    $('editor-focus').value = preset.focus;
-    $('editor-save-btn').textContent = 'Save Changes';
-    $('preset-editor').style.display = 'block';
-    $('editor-label').focus();
-}}
-
-function cancelPresetEdit() {{
-    _editingId = null;
-    $('preset-editor').style.display = 'none';
-}}
-
-function savePresetEdit() {{
-    const label = $('editor-label').value;
-    const focus = $('editor-focus').value;
-    if (_editingId) {{
-        send('update_custom_preset', {{ id: _editingId, label: label, focus: focus }});
-    }} else {{
-        send('add_custom_preset', {{ label: label, focus: focus }});
-    }}
-    _editingId = null;
-    $('preset-editor').style.display = 'none';
-}}
-
-// --- Model dropdown -----------------------------------------------------
-
-let _modelList = [];      // last-fetched list of id/label objects
-let _lastProvider = '';   // refetch when this changes
-
-function syncModelDropdown(currentId) {{
-    const sel = $('model-select');
-    sel.innerHTML = '';
-    if (_modelList.length === 0) {{
-        const opt = document.createElement('option');
-        opt.value = currentId || '';
-        opt.textContent = currentId ? currentId + ' (saved)' : 'Loading models…';
-        sel.appendChild(opt);
-    }} else {{
-        let matched = false;
-        _modelList.forEach(m => {{
-            const opt = document.createElement('option');
-            opt.value = m.id;
-            opt.textContent = m.label;
-            if (m.id === currentId) {{ opt.selected = true; matched = true; }}
-            sel.appendChild(opt);
-        }});
-        // If the saved model isn't in the fetched list, show it as a
-        // disabled item at the top so the user can see what's saved.
-        if (currentId && !matched) {{
-            const opt = document.createElement('option');
-            opt.value = currentId;
-            opt.textContent = currentId + ' (saved, not in current list)';
-            opt.selected = true;
-            sel.insertBefore(opt, sel.firstChild);
-        }}
-        const other = document.createElement('option');
-        other.value = '__other__';
-        other.textContent = 'Other… (type a model name)';
-        sel.appendChild(other);
-    }}
-    // Show manual row if Other is selected
-    $('model-manual-row').style.display =
-        (sel.value === '__other__') ? 'block' : 'none';
-}}
-
-function refreshModels() {{
-    $('model-status').textContent = 'Loading…';
-    send('fetch_models', null);
-}}
-
-window.onModelsLoaded = function(payload) {{
-    if (payload.ok) {{
-        _modelList = payload.models || [];
-        $('model-status').textContent = _modelList.length + ' available';
-        const currentModel = $('model-input').value;
-        // If nothing is saved yet, or the saved one isn't in this server's
-        // list, auto-pick the first model so Test Connection just works.
-        const matched = _modelList.some(m => m.id === currentModel);
-        if (_modelList.length > 0 && (!currentModel || !matched)) {{
-            const auto = _modelList[0].id;
-            $('model-input').value = auto;
-            send('set_model', auto);
-            syncModelDropdown(auto);
-        }} else {{
-            syncModelDropdown(currentModel);
-        }}
-    }} else {{
-        _modelList = [];
-        $('model-status').textContent = '⚠ ' + (payload.error || 'load failed');
-        syncModelDropdown($('model-input').value);
-    }}
-}};
-
-function onModelPicked() {{
-    const sel = $('model-select');
-    const v = sel.value;
-    if (v === '__other__') {{
-        $('model-manual-row').style.display = 'block';
-        $('model-input').focus();
-        return;
-    }}
-    $('model-manual-row').style.display = 'none';
-    if (v) {{
-        $('model-input').value = v;
-        send('set_model', v);
-    }}
-}}
-
-renderState(initialState);
-renderMeetings();
-
-// Fetch models in the background on first open. Also refetch whenever
-// the provider dropdown changes (provider is in the state pushed back
-// after set_provider).
-refreshModels();
-
-(function() {{
-    _lastProvider = initialState.llm_provider;
-    const origOnState = window.onState;
-    window.onState = function(state) {{
-        if (state.llm_provider !== _lastProvider) {{
-            _lastProvider = state.llm_provider;
-            _modelList = [];   // clear stale list before refetching
-            refreshModels();
-        }}
-        origOnState(state);
-    }};
-}})();
-</script>
-</body>
-</html>"""
+def _build_html():
+    meetings = _meeting_files()
+    dictations = dictation_log.recent()
+    state = _state_snapshot()
+    # "</" must be escaped or a literal "</script>" inside a transcript
+    # would terminate the script block.
+    boot = json.dumps({
+        "state": state,
+        "meetings": meetings,
+        "dictations": dictations,
+    }).replace("</", "<\\/")
+    return (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        "<title>MyWhisper</title>\n<style>\n" + _ui_asset("style.css")
+        + "\n</style>\n</head>\n<body>\n" + _BODY
+        + "\n<script>\nwindow.BOOT = " + boot + ";\n"
+        + _ui_asset("app.js") + "\n</script>\n</body>\n</html>"
+    )
 
 
 # -- Panel creation ----------------------------------------------------------
@@ -1970,7 +842,7 @@ def _create_panel():
     _panel.setBackgroundColor_(NSColor.colorWithRed_green_blue_alpha_(
         0.102, 0.102, 0.18, 1.0
     ))
-    _panel.setMinSize_(NSMakeSize(480, 480))
+    _panel.setMinSize_(NSMakeSize(840, 560))
 
     # Hide the traffic-light buttons; we draw our own close button in HTML.
     for btn_index in (0, 1, 2):   # close, miniaturize, zoom
