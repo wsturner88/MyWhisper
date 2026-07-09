@@ -177,8 +177,9 @@ function renderReader() {
     return;
   }
   const m = MEETINGS[selectedMeeting];
-  const tabs = [["notes", "Notes"], ["transcript", "Transcript"]];
-  if ((m.notes_md || "").trim() || editingPart === "mynotes") tabs.push(["mynotes", "My Notes"]);
+  // My Notes is always available so you can ADD notes to any meeting
+  // after the fact — a Redo then folds them into the summary.
+  const tabs = [["notes", "Notes"], ["transcript", "Transcript"], ["mynotes", "My Notes"]];
   if (!tabs.some(t => t[0] === readerTab)) readerTab = "notes";
 
   const raw = readerTab === "notes" ? m.summary_md
@@ -186,16 +187,27 @@ function renderReader() {
     : m.notes_md;
   const editable = readerTab !== "transcript";
   const isEditing = editingPart === readerTab;
+  const emptyNotes = readerTab === "mynotes" && !(m.notes_md || "").trim();
 
   let bodyHtml;
   if (isEditing) {
+    const hint = readerTab === "mynotes"
+      ? "Add names, corrections, decisions, follow-ups — anything. Then " +
+        "hit “Redo summary” and the AI folds these into the notes."
+      : "Plain text with markdown — ## headings, **bold**, - bullets.";
     bodyHtml =
       '<textarea id="edit-area" style="min-height: 340px;"></textarea>' +
       '<div class="field-row" style="margin-top: 10px;">' +
         '<button class="btn primary" id="btn-save-edit">Save</button>' +
         '<button class="btn" id="btn-cancel-edit">Cancel</button>' +
-        '<span class="field-hint">Plain text with markdown — ## headings, ' +
-        '**bold**, - bullets.</span>' +
+        '<span class="field-hint">' + hint + "</span>" +
+      "</div>";
+  } else if (emptyNotes) {
+    bodyHtml =
+      '<div class="empty" style="padding: 40px 16px;">' +
+        "No notes yet.<br>Click <b>Edit</b> to add context — names, " +
+        "corrections, decisions — then <b>Redo summary</b> to fold it " +
+        "into the AI notes." +
       "</div>";
   } else {
     bodyHtml = '<div class="md">' + mdToHtml(raw || "_(empty)_") + "</div>";
