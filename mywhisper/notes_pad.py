@@ -162,13 +162,17 @@ class NotesPad:
         self._text_view = text_view
 
     # ------------------------------------------------------------------
-    def show(self):
+    def show(self, initial_text=""):
         if self._disabled:
             return
         try:
             if self._window is None:
                 self._build()
-            self._text_view.setString_("")
+            self._text_view.setString_(initial_text or "")
+            # Park the cursor at the end so typing continues after any
+            # pre-filled header.
+            n = len((initial_text or ""))
+            self._text_view.setSelectedRange_((n, 0))
             # orderFrontRegardless avoids activating MyWhisper.app —
             # the panel just appears above other windows without
             # stealing focus. The user clicks into it to type.

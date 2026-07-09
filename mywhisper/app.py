@@ -676,7 +676,11 @@ class MyWhisperApp(rumps.App):
         self.state = "meeting"
         self._sync()
         self.meeting_panel.show()
-        self.notes_panel.show()
+        # Pre-fill the notes pad with a date/time header so notes are
+        # self-dating; the cursor lands on the blank line below it.
+        started = getattr(self, "_meeting_started_at", None) or datetime.now()
+        header = started.strftime("%A, %B %-d, %Y · %-I:%M %p") + "\n\n"
+        self.notes_panel.show(initial_text=header)
         self._sysaudio_ok = self.sysaudio.start(_tmp_wav())
         if not self._sysaudio_ok:
             log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
