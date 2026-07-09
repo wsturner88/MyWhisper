@@ -18,6 +18,22 @@ from . import (audio, autostart, calendar_lookup, config, dashboard, diarize,
 
 HELPER_NAME = "mywhisper-sysaudio"
 
+
+# Make a Dock-icon click (when the app is already running, with no window
+# up) reveal the dashboard. rumps owns the NSApplication delegate, so we
+# graft this delegate method onto its class with an Objective-C category.
+try:
+    import objc
+    from rumps.rumps import NSApp as _RumpsDelegate
+
+    # A PyObjC category's class name must match the class it extends.
+    class NSApp(objc.Category(_RumpsDelegate)):
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+            dashboard.reveal()
+            return True
+except Exception:
+    logging.getLogger("mywhisper").exception("dock reopen hook failed")
+
 # Menu bar label. Image icons do not render reliably on recent macOS, so
 # the indicator is plain text — this is what shows in the menu bar.
 _TITLES = {
@@ -146,17 +162,27 @@ class MyWhisperApp(rumps.App):
         super().__init__("MyWhisper", title=_TITLES["idle"], quit_button=None)
         log.info("=== MyWhisper starting ===")
 
-        # Hide the Dock icon. The venv's python re-execs Homebrew's
-        # Python.app binary, so macOS shows *that* bundle's Dock icon
-        # (the Python rocket) and our own Info.plist LSUIElement is
-        # never consulted. Setting the activation policy at runtime
-        # overrides it regardless of which binary is running us.
+        # Show a real Dock icon so MyWhisper can be launched/raised like
+        # an app; clicking it reveals the dashboard (see the reopen
+        # handler below). Because the venv re-execs Homebrew's Python.app,
+        # the Dock would otherwise show the Python rocket — so we force
+        # our own icon image.
         try:
-            from AppKit import NSApplication
-            NSApplication.sharedApplication().setActivationPolicy_(1)
-            log.info("dock icon hidden (accessory activation policy)")
+            from AppKit import NSApplication, NSImage
+            nsapp = NSApplication.sharedApplication()
+            nsapp.setActivationPolicy_(0)   # NSApplicationActivationPolicyRegular
+            icon_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "AppIcon.icns")
+            if not os.path.exists(icon_path):
+                icon_path = os.path.join(os.path.dirname(
+                    os.path.abspath(__file__)), "icon.png")
+            img = NSImage.alloc().initWithContentsOfFile_(icon_path)
+            if img is not None:
+                nsapp.setApplicationIconImage_(img)
+            log.info("dock icon shown (regular activation policy)")
         except Exception:
-            log.exception("could not hide Dock icon")
+            log.exception("could not set up Dock icon")
         self.cfg = config.load()
         self.out_dir = config.output_dir(self.cfg)
         self.state = "idle"

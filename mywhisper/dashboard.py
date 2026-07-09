@@ -175,6 +175,24 @@ def _save_vocab_text(text):
 
 # -- Bridge: messages from JavaScript --------------------------------------
 
+def _pyify(obj):
+    """Recursively convert Cocoa collection types (NSDictionary/NSArray,
+    passed up from the WKWebView) into native Python dict/list/str so the
+    rest of the module can use isinstance and .get() safely."""
+    if isinstance(obj, (str, bool, int, float)) or obj is None:
+        return obj
+    # NSDictionary / NSArray expose the mapping / sequence protocols but
+    # are NOT dict / list subclasses.
+    if hasattr(obj, "allKeys") or isinstance(obj, dict):
+        return {str(k): _pyify(obj[k]) for k in obj.keys()}
+    if hasattr(obj, "count") and not isinstance(obj, (str, bytes)):
+        try:
+            return [_pyify(x) for x in obj]
+        except TypeError:
+            pass
+    return str(obj)
+
+
 class _BridgeHandler(NSObject):
     """Receives postMessage() calls from the dashboard HTML."""
 
@@ -194,7 +212,15 @@ class _BridgeHandler(NSObject):
 
     def userContentController_didReceiveScriptMessage_(self, controller, message):
         try:
-            body = dict(message.body())
+            # Deep-convert the whole message from Cocoa types to native
+            # Python. dict(message.body()) only converts the TOP level —
+            # a nested object (e.g. {filename, preset}) stays an
+            # NSDictionary, which fails isinstance(x, dict) and gets
+            # stringified into garbage. That surfaced as a bogus 'File
+            # not found' on the redo-with-preset and edit actions.
+            body = _pyify(message.body())
+            if not isinstance(body, dict):
+                return
             action = body.get("action")
             log.info("dashboard bridge: %s", action)
             handler = _ACTIONS.get(action)
@@ -410,6 +436,7 @@ def _resolve_meeting(raw):
     import unicodedata
     name = os.path.basename(str(raw or ""))
     if not (name.startswith("meeting_") and name.endswith(".md")):
+        log.warning("dashboard: bad meeting name from UI: %r", name)
         return None
     app_dir = config.app_dir()
     candidates = [name,
@@ -993,17 +1020,13 @@ def refresh_if_open():
         log.exception("dashboard: refresh failed")
 
 
-def open_dashboard():
-    """Toggle the dashboard panel — show it (refreshed) or hide it."""
+def reveal():
+    """Always show the dashboard, bringing it to front (never toggles).
+    Used by the Dock-icon click, where hiding would be surprising."""
     global _panel, _webview
     try:
-        if _panel is not None and _panel.isVisible():
-            _panel.orderOut_(None)
-            return
-
         if _panel is None:
             _create_panel()
-
         _load_content()
         _panel.makeKeyAndOrderFront_(None)
         try:
@@ -1011,6 +1034,15 @@ def open_dashboard():
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         except Exception:
             pass
-        log.info("dashboard: opened")
+        log.info("dashboard: revealed")
     except Exception:
-        log.exception("dashboard: failed to open")
+        log.exception("dashboard: failed to reveal")
+
+
+def open_dashboard():
+    """Toggle the dashboard panel — show it (refreshed) or hide it."""
+    global _panel
+    if _panel is not None and _panel.isVisible():
+        _panel.orderOut_(None)
+        return
+    reveal()
