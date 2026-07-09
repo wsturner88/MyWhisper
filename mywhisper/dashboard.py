@@ -397,6 +397,46 @@ def _act_import_transcript(body):
     threading.Thread(target=_work, daemon=True).start()
 
 
+def _resolve_meeting(raw):
+    """Turn a filename from the JS side into a real meeting Path, or None.
+
+    macOS stores filenames decomposed (NFD: 'e' + combining acute) while
+    the browser/JSON round-trip usually hands them back composed (NFC:
+    'é'). An exact `app_dir / name` then fails path.exists() even though
+    the file is right there — which showed up as a bogus 'File not found'
+    when re-summarizing meetings whose title had a curly apostrophe or an
+    accent. Try the exact name, both normalizations, then a basename
+    match against what's actually on disk."""
+    import unicodedata
+    name = os.path.basename(str(raw or ""))
+    if not (name.startswith("meeting_") and name.endswith(".md")):
+        return None
+    app_dir = config.app_dir()
+    candidates = [name,
+                  unicodedata.normalize("NFC", name),
+                  unicodedata.normalize("NFD", name)]
+    for cand in candidates:
+        p = app_dir / cand
+        if p.exists():
+            return p
+    # Last resort: compare normalized basenames against the directory.
+    target = unicodedata.normalize("NFC", name)
+    on_disk = []
+    try:
+        for p in app_dir.glob("meeting_*.md"):
+            on_disk.append(p.name)
+            if unicodedata.normalize("NFC", p.name) == target:
+                return p
+    except OSError:
+        pass
+    log.warning("dashboard: could not resolve meeting file %r in %s "
+                "(%d files on disk; closest: %s)",
+                name, app_dir, len(on_disk),
+                ", ".join(n for n in on_disk if n[:25] == name[:25])[:200]
+                or "none share the prefix")
+    return None
+
+
 def _meeting_payload(path):
     """Freshly parsed parts + raw content, in the shape app.js expects."""
     parts = output.parse_meeting(path)
@@ -413,12 +453,11 @@ def _act_save_meeting_part(body):
     """Inline edit from the reader — replace the summary or the typed
     notes of a saved meeting, leaving everything else untouched."""
     val = body.get("value") or {}
-    name = os.path.basename(str(val.get("filename") or ""))
     part = val.get("part")
     text = str(val.get("text") or "").strip()
-    path = config.app_dir() / name
-    if not (name.startswith("meeting_") and name.endswith(".md")
-            and path.exists() and part in ("summary", "notes")):
+    path = _resolve_meeting(val.get("filename"))
+    name = path.name if path else os.path.basename(str(val.get("filename") or ""))
+    if path is None or part not in ("summary", "notes"):
         _call_js("onSavePartDone",
                  {"ok": False, "filename": name, "error": "Bad request."})
         return
@@ -447,13 +486,13 @@ def _act_resummarize_meeting(body):
     val = body.get("value")
     preset = None
     if isinstance(val, dict):
-        name = os.path.basename(str(val.get("filename") or ""))
+        raw = val.get("filename") or ""
         preset = str(val.get("preset") or "").strip() or None
     else:
-        name = os.path.basename(str(val or ""))
-    path = config.app_dir() / name
-    if not (name.startswith("meeting_") and name.endswith(".md")
-            and path.exists()):
+        raw = val
+    path = _resolve_meeting(raw)
+    name = path.name if path else os.path.basename(str(raw or ""))
+    if path is None:
         _call_js("onResummarizeDone",
                  {"ok": False, "filename": name, "error": "File not found."})
         return
@@ -525,10 +564,10 @@ def _act_record_meeting(body):
 
 def _act_delete_meeting(body):
     """Move a meeting file to the macOS Trash — recoverable, never rm."""
-    name = os.path.basename(str(body.get("value") or ""))
-    path = config.app_dir() / name
-    if not (name.startswith("meeting_") and name.endswith(".md")
-            and path.exists()):
+    raw = body.get("value")
+    path = _resolve_meeting(raw)
+    name = path.name if path else os.path.basename(str(raw or ""))
+    if path is None:
         _call_js("onDeleteDone",
                  {"ok": False, "filename": name, "error": "File not found."})
         return
@@ -549,11 +588,10 @@ def _act_delete_meeting(body):
 
 
 def _act_open_meeting(body):
-    """Open a meeting .md file in the default editor. Only basenames of
-    real meeting files inside the data folder are accepted."""
-    name = os.path.basename(str(body.get("value") or ""))
-    path = config.app_dir() / name
-    if name.startswith("meeting_") and name.endswith(".md") and path.exists():
+    """Open a meeting .md file in the default editor. Only real meeting
+    files inside the data folder are accepted."""
+    path = _resolve_meeting(body.get("value"))
+    if path is not None:
         subprocess.run(["open", str(path)], check=False)
 
 
