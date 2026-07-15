@@ -256,6 +256,9 @@ def _anthropic(key, model, system, user, max_tokens, on_token=None):
 
 def _consume_openai_sse(resp, on_token):
     """OpenAI-style SSE: 'data: {json}\\n\\n' lines with content deltas."""
+    # Streaming responses often omit a charset, and requests then decodes
+    # as Latin-1 — turning every em dash/curly quote into 'â€"' mojibake.
+    resp.encoding = "utf-8"
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
@@ -284,6 +287,7 @@ def _consume_anthropic_sse(resp, on_token):
     """Anthropic SSE: 'event: ...' and 'data: {json}' lines.
     Text deltas live in `content_block_delta` events under .delta.text.
     """
+    resp.encoding = "utf-8"   # see _consume_openai_sse
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
@@ -469,6 +473,7 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
 def _consume_ollama_stream(resp, on_token):
     """Ollama streams newline-delimited JSON. Each line has
     {'message': {'content': '...'}} until done==true."""
+    resp.encoding = "utf-8"   # see _consume_openai_sse
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line:
