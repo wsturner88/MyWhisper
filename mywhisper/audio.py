@@ -15,7 +15,25 @@ def to_mono_16k(data, sr):
     if sr != TARGET_SR:
         divisor = gcd(sr, TARGET_SR)
         data = resample_poly(data, TARGET_SR // divisor, sr // divisor)
-    return np.asarray(data, dtype="float32")
+    return normalize_peak(np.asarray(data, dtype="float32"))
+
+
+# Quiet recordings hurt Whisper accuracy. Boost toward a comfortable
+# peak, but never more than 15x — amplifying a recording that is pure
+# noise floor to full scale just hands Whisper loud garbage.
+_PEAK_TARGET = 0.9
+_PEAK_LOUD_ENOUGH = 0.5
+_MAX_GAIN = 15.0
+
+
+def normalize_peak(data):
+    if len(data) == 0:
+        return data
+    peak = float(np.max(np.abs(data)))
+    if peak <= 0.0 or peak >= _PEAK_LOUD_ENOUGH:
+        return data
+    gain = min(_PEAK_TARGET / peak, _MAX_GAIN)
+    return np.asarray(data * gain, dtype="float32")
 
 
 def load_mono_16k(path):

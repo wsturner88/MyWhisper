@@ -188,7 +188,9 @@ def _openrouter(key, model, system, user, max_tokens, on_token=None):
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # Reasoning models return content=None when the token budget is
+        # spent on thinking — treat that as empty, not a crash.
+        return (resp.json()["choices"][0]["message"]["content"] or "").strip()
 
     # Streaming via OpenAI-style SSE
     resp = requests.post(
@@ -254,6 +256,9 @@ def _anthropic(key, model, system, user, max_tokens, on_token=None):
 
 def _consume_openai_sse(resp, on_token):
     """OpenAI-style SSE: 'data: {json}\\n\\n' lines with content deltas."""
+    # Streaming responses often omit a charset, and requests then decodes
+    # as Latin-1 — turning every em dash/curly quote into 'â€"' mojibake.
+    resp.encoding = "utf-8"
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
@@ -282,6 +287,7 @@ def _consume_anthropic_sse(resp, on_token):
     """Anthropic SSE: 'event: ...' and 'data: {json}' lines.
     Text deltas live in `content_block_delta` events under .delta.text.
     """
+    resp.encoding = "utf-8"   # see _consume_openai_sse
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
@@ -400,6 +406,11 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
                         {"role": "user", "content": user},
                     ],
                     "stream": False,
+                    # Skip the chain-of-thought trace on "thinking" models
+                    # (e.g. gemma3/4 reasoning variants). Without this they
+                    # spend minutes reasoning before writing a word and time
+                    # out on long transcripts. Ignored by non-thinking models.
+                    "think": False,
                     "options": {"num_predict": max_tokens},
                 },
                 timeout=600,
@@ -416,6 +427,7 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
                     {"role": "user", "content": user},
                 ],
                 "stream": True,
+                "think": False,   # see note above
                 "options": {"num_predict": max_tokens},
             },
             stream=True,
@@ -461,6 +473,7 @@ def _custom_chat(url, model, system, user, max_tokens, auth_token=None,
 def _consume_ollama_stream(resp, on_token):
     """Ollama streams newline-delimited JSON. Each line has
     {'message': {'content': '...'}} until done==true."""
+    resp.encoding = "utf-8"   # see _consume_openai_sse
     full = []
     for line in resp.iter_lines(decode_unicode=True):
         if not line:

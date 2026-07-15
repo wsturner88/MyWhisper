@@ -1,6 +1,7 @@
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,6 +17,22 @@ from . import (audio, autostart, calendar_lookup, config, dashboard, diarize,
                transcribe, vocab, waveform)
 
 HELPER_NAME = "mywhisper-sysaudio"
+
+
+# Make a Dock-icon click (when the app is already running, with no window
+# up) reveal the dashboard. rumps owns the NSApplication delegate, so we
+# graft this delegate method onto its class with an Objective-C category.
+try:
+    import objc
+    from rumps.rumps import NSApp as _RumpsDelegate
+
+    # A PyObjC category's class name must match the class it extends.
+    class NSApp(objc.Category(_RumpsDelegate)):
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+            dashboard.reveal()
+            return True
+except Exception:
+    logging.getLogger("mywhisper").exception("dock reopen hook failed")
 
 # Menu bar label. Image icons do not render reliably on recent macOS, so
 # the indicator is plain text — this is what shows in the menu bar.
@@ -37,6 +54,10 @@ log = logging.getLogger("mywhisper")
 
 # 0.3s at 16kHz — anything shorter is treated as "no audio captured".
 _MIN_SAMPLES = 4800
+
+# A recording whose loudest RMS window stayed under this was true silence;
+# above it, the mic clearly had signal (normal speech peaks ~0.02-0.06 RMS).
+_SPEECH_LEVEL = 0.015
 
 # Push-to-talk must be held at least this long, or it's treated as an
 # accidental tap and discarded without transcribing.
@@ -70,10 +91,98 @@ def _cleanup(*paths):
                 pass
 
 
+def _install_edit_menu():
+    """Cmd-C/V/X/A/Z resolve through the app's main menu. A menu-bar app
+    has no Edit menu, so keyboard paste silently fails in every window
+    (dashboard text boxes, import panel). The menu is never visible
+    (LSUIElement app) but still routes the shortcuts to whichever text
+    field has focus."""
+    from AppKit import NSApp, NSMenu, NSMenuItem
+    main = NSApp.mainMenu()
+    if main is None:
+        main = NSMenu.alloc().init()
+        NSApp.setMainMenu_(main)
+    edit = NSMenu.alloc().initWithTitle_("Edit")
+    for title, sel, key in (
+            ("Undo", "undo:", "z"),
+            ("Redo", "redo:", "Z"),       # uppercase = Cmd-Shift-Z
+            ("Cut", "cut:", "x"),
+            ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"),
+            ("Select All", "selectAll:", "a")):
+        edit.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, sel, key))
+    holder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Edit", None, "")
+    holder.setSubmenu_(edit)
+    main.addItem_(holder)
+
+    # Window shortcuts so the dashboard behaves like a real app window:
+    # Cmd-W closes (hides) it, Cmd-M minimizes it.
+    window_menu = NSMenu.alloc().initWithTitle_("Window")
+    for title, sel, key in (
+            ("Close Window", "performClose:", "w"),
+            ("Minimize", "performMiniaturize:", "m")):
+        window_menu.addItem_(
+            NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, sel, key))
+    wholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Window", None, "")
+    wholder.setSubmenu_(window_menu)
+    main.addItem_(wholder)
+
+
+@rumps.notifications
+def _on_notification_click(info):
+    """User clicked one of our notifications. Meeting-ready notifications
+    carry the path of the saved .md file — open it."""
+    try:
+        path = info.get("open_path")
+    except Exception:
+        path = None
+    if path and os.path.exists(path):
+        subprocess.run(["open", path], check=False)
+        log.info("notification click: opened %s", path)
+
+
+def _preserve_last_dictation(path):
+    """Keep the most recent dictation audio (a single file, overwritten
+    every cycle) so a garbled recording can be played back afterwards to
+    tell a mic problem from a transcription problem."""
+    try:
+        if path and os.path.exists(path):
+            shutil.move(path, str(config.app_dir() / "last_dictation.wav"))
+    except Exception:
+        _cleanup(path)
+
+
 class MyWhisperApp(rumps.App):
     def __init__(self):
         super().__init__("MyWhisper", title=_TITLES["idle"], quit_button=None)
         log.info("=== MyWhisper starting ===")
+
+        # Show a real Dock icon so MyWhisper can be launched/raised like
+        # an app; clicking it reveals the dashboard (see the reopen
+        # handler below). Because the venv re-execs Homebrew's Python.app,
+        # the Dock would otherwise show the Python rocket — so we force
+        # our own icon image.
+        try:
+            from AppKit import NSApplication, NSImage
+            nsapp = NSApplication.sharedApplication()
+            nsapp.setActivationPolicy_(0)   # NSApplicationActivationPolicyRegular
+            icon_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "AppIcon.icns")
+            if not os.path.exists(icon_path):
+                icon_path = os.path.join(os.path.dirname(
+                    os.path.abspath(__file__)), "icon.png")
+            img = NSImage.alloc().initWithContentsOfFile_(icon_path)
+            if img is not None:
+                nsapp.setApplicationIconImage_(img)
+            log.info("dock icon shown (regular activation policy)")
+        except Exception:
+            log.exception("could not set up Dock icon")
         self.cfg = config.load()
         self.out_dir = config.output_dir(self.cfg)
         self.state = "idle"
@@ -116,6 +225,8 @@ class MyWhisperApp(rumps.App):
             self.mi_status,
             None,
             rumps.MenuItem("Dashboard…", callback=self._open_dashboard),
+            rumps.MenuItem("Open Last Meeting Notes",
+                           callback=self._open_last_meeting),
             rumps.MenuItem("Open Notes Folder", callback=self._open_folder),
             None,
             rumps.MenuItem("Quit", callback=rumps.quit_application),
@@ -136,6 +247,12 @@ class MyWhisperApp(rumps.App):
         rumps.Timer(self._poll, 0.2).start()
         rumps.Timer(self._tick_waveform, 0.04).start()
         threading.Thread(target=self._prewarm, daemon=True).start()
+        threading.Thread(target=self._scan_recovery, daemon=True).start()
+
+        try:
+            _install_edit_menu()
+        except Exception:
+            log.exception("edit menu install failed")
 
         # Ask for Calendar access once. If user has never been prompted,
         # this shows the system dialog. If already decided, this is a
@@ -172,6 +289,141 @@ class MyWhisperApp(rumps.App):
             log.info("prewarm: speech model ready")
         except Exception:
             log.exception("prewarm failed")
+
+    # -- crash recovery ------------------------------------------------
+    # Recordings live in the temp dir while a session is running and are
+    # deleted only on a clean finish, so audio found there at startup is
+    # a recording some crash orphaned. Bytes on disk win: move them to
+    # safety and rebuild what we can.
+
+    def _scan_recovery(self):
+        import glob
+        import soundfile as sf
+        time.sleep(10)   # let startup + model prewarm get going first
+        try:
+            now = time.time()
+            found = []
+            for p in sorted(glob.glob(
+                    os.path.join(tempfile.gettempdir(), "mywhisper_*.wav"))):
+                try:
+                    st = os.stat(p)
+                    if now - st.st_mtime < 120:
+                        continue   # fresh — could belong to a live recorder
+                    info = sf.info(p)
+                    dur = info.frames / float(info.samplerate or 1)
+                except Exception:
+                    continue
+                if dur < 5.0:
+                    _cleanup(p)    # an aborted tap, nothing worth saving
+                    continue
+                found.append({"path": p, "mtime": st.st_mtime,
+                              "dur": dur, "channels": info.channels})
+            if not found:
+                return
+
+            log.warning("recovery: found %d orphaned recording(s)", len(found))
+            rec_dir = config.app_dir() / "recovered"
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            for f in found:
+                ts = datetime.fromtimestamp(f["mtime"]).strftime("%Y-%m-%d_%H%M%S")
+                kind = "system" if f["channels"] > 1 else "mic"
+                dest = rec_dir / f"recovered_{ts}_{kind}.wav"
+                n = 1
+                while dest.exists():
+                    dest = rec_dir / f"recovered_{ts}_{kind}_{n}.wav"
+                    n += 1
+                shutil.move(f["path"], dest)
+                f["path"] = str(dest)
+
+            # Pair a mic track with a system track recorded at the same
+            # time (dual-channel meeting); a lone long mic track is a
+            # mic-only meeting; a lone short one is kept but not processed.
+            mics = [f for f in found if f["channels"] == 1]
+            syss = [f for f in found if f["channels"] > 1]
+            # Longest mic tracks first, and pair each with the candidate
+            # system track closest in duration — the two tracks of one
+            # meeting ran simultaneously, so their lengths nearly match.
+            mics.sort(key=lambda f: -f["dur"])
+            for mic in mics:
+                candidates = [s for s in syss
+                              if abs(s["mtime"] - mic["mtime"]) < 90]
+                sys_match = min(
+                    candidates,
+                    key=lambda s: abs(s["dur"] - mic["dur"]),
+                    default=None)
+                if sys_match:
+                    syss.remove(sys_match)
+                if sys_match or mic["dur"] >= 90:
+                    started = datetime.fromtimestamp(mic["mtime"] - mic["dur"])
+                    self._recover_meeting(
+                        mic["path"],
+                        sys_match["path"] if sys_match else None, started)
+                else:
+                    self._events.put((
+                        "notify", "Unfinished dictation recovered",
+                        "Audio saved in the recovered folder "
+                        "(menu → Open Notes Folder)."))
+        except Exception:
+            log.exception("recovery: scan failed")
+
+    def _recover_meeting(self, mic_path, sys_path, started_at):
+        log.info("recovery: rebuilding meeting from %s + %s",
+                 mic_path, sys_path or "(no system audio)")
+        self._events.put(("notify", "Recovering an unfinished meeting",
+                          "Found a recording that never finished — "
+                          "rebuilding it now."))
+        mic_data = audio.load_mono_16k(mic_path)
+        sys_data = audio.load_mono_16k(sys_path) if sys_path else None
+        segments, labeled = transcribe.transcribe_meeting(
+            mic_data, sys_data, self.cfg["whisper"]["model"],
+            initial_prompt=vocab.prompt())
+        if not segments:
+            log.warning("recovery: no speech in orphaned recording")
+            return
+        transcript_md = output.format_transcript(segments, labeled)
+        text = output.attributed_text(segments, labeled)
+
+        cal_event = None
+        try:
+            cal_event = calendar_lookup.find_meeting_near(started_at)
+        except Exception:
+            log.exception("recovery: calendar lookup failed")
+        cal_title = (cal_event.get("title") if cal_event else "") or ""
+
+        path = output.save_meeting(
+            config.app_dir(), transcript_md,
+            "## ⏳ Summary pending\n\nIf this never fills in, click Redo "
+            "on this meeting in the Dashboard.",
+            title=cal_title, stamp=started_at)
+
+        banner = ("> ♻️ Recovered recording — the app closed before this "
+                  "meeting finished processing; it was rebuilt "
+                  "automatically on restart.")
+        title = ""
+        try:
+            title, summary_md = summarize.summarize_transcript(
+                self.cfg, text, preset_id=config.get_meeting_preset())
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("empty summary")
+        except Exception as e:
+            log.exception("recovery: summary failed")
+            summary_md = (f"## ⚠️ Summary failed ({e})\n\nThe transcript "
+                          "below is intact — click Redo on this meeting "
+                          "in the Dashboard to try again.")
+        summary_md = f"{banner}\n\n{summary_md}"
+
+        stamp = output.parse_meeting(path)["stamp"]
+        output.rewrite_meeting(path, title or cal_title, stamp, summary_md,
+                               "", transcript_md)
+        if title:
+            path = output.rename_meeting(path, title)
+        log.info("recovery: rebuilt %s", path)
+        self._last_meeting_path = str(path)
+        self._events.put(("notify",
+                          f"Recovered: {title or cal_title or 'meeting'}",
+                          f"Click to open {path.name}",
+                          {"open_path": str(path)}))
+        self._events.put(("refresh_dashboard",))
 
     # -- meeting submenu rebuilds when presets change ------------------
     def _rebuild_meeting_submenu(self):
@@ -253,9 +505,9 @@ class MyWhisperApp(rumps.App):
             self.meeting_panel.tick()
 
     # -- UI helpers ---------------------------------------------------
-    def _notify(self, title, message):
+    def _notify(self, title, message, data=None):
         try:
-            rumps.notification("MyWhisper", title, message)
+            rumps.notification("MyWhisper", title, message, data=data)
         except Exception:
             pass
 
@@ -303,13 +555,16 @@ class MyWhisperApp(rumps.App):
                 elif kind == "stop_meeting":
                     self._click_stop_meeting(None)
                 elif kind == "notify":
-                    self._notify(event[1], event[2])
+                    self._notify(event[1], event[2],
+                                 event[3] if len(event) > 3 else None)
                 elif kind == "paste":
                     try:
                         paste.paste_text(event[1])
                         log.info("dictation: pasted %d characters", len(event[1]))
                     except Exception:
                         log.exception("paste failed")
+                elif kind == "refresh_dashboard":
+                    dashboard.refresh_if_open()
                 elif kind == "done":
                     self.state = "idle"
                     self.meeting_panel.hide()
@@ -341,6 +596,20 @@ class MyWhisperApp(rumps.App):
 
     def _open_folder(self, _):
         subprocess.run(["open", str(config.app_dir())], check=False)
+
+    def _open_last_meeting(self, _):
+        path = getattr(self, "_last_meeting_path", None)
+        if not path or not os.path.exists(path):
+            # Nothing from this session — fall back to the newest meeting
+            # file on disk.
+            existing = sorted(Path(config.app_dir()).glob("meeting_*.md"),
+                              key=lambda p: p.stat().st_mtime)
+            path = str(existing[-1]) if existing else None
+        if path and os.path.exists(path):
+            subprocess.run(["open", path], check=False)
+        else:
+            self._notify("No meetings yet",
+                         "Finished meeting notes will show up here.")
 
     def _click_dictation(self, _):
         if self.state == "idle":
@@ -407,7 +676,11 @@ class MyWhisperApp(rumps.App):
         self.state = "meeting"
         self._sync()
         self.meeting_panel.show()
-        self.notes_panel.show()
+        # Pre-fill the notes pad with a date/time header so notes are
+        # self-dating; the cursor lands on the blank line below it.
+        started = getattr(self, "_meeting_started_at", None) or datetime.now()
+        header = started.strftime("%A, %B %-d, %Y · %-I:%M %p") + "\n\n"
+        self.notes_panel.show(initial_text=header)
         self._sysaudio_ok = self.sysaudio.start(_tmp_wav())
         if not self._sysaudio_ok:
             log.warning("meeting: system audio unavailable: %s", self.sysaudio.error)
@@ -474,14 +747,34 @@ class MyWhisperApp(rumps.App):
                 self._events.put(("paste", text))
                 log.info("dictation: queued paste of %d characters", len(text))
             else:
-                self._events.put(("notify", "Dictation", "No speech detected."))
-                log.info("dictation: empty transcript")
+                drops = transcribe.last_drops
+                had_signal = self.mic.max_level >= _SPEECH_LEVEL
+                log.info("dictation: empty transcript (max mic level %.4f)",
+                         self.mic.max_level)
+                if drops.get("non-english") or drops.get("repetition"):
+                    # Whisper produced output but it was hallucinated junk —
+                    # the audio reached us garbled. Very different problem
+                    # from silence, so say so.
+                    self._events.put(("notify", "Dictation",
+                                      "Audio came through garbled — kept a "
+                                      "copy as last_dictation.wav (menu → "
+                                      "Open Notes Folder)."))
+                elif had_signal:
+                    # The mic clearly had signal, so an empty transcript is
+                    # a failure, not silence — don't gaslight the user.
+                    self._events.put(("notify", "Dictation",
+                                      "Heard audio but couldn't make out "
+                                      "words — try again? (kept a copy as "
+                                      "last_dictation.wav)"))
+                else:
+                    self._events.put(("notify", "Dictation",
+                                      "No speech detected."))
         except Exception:
             log.exception("dictation: failed")
             self._events.put(("notify", "Dictation failed",
                               "See ~/MyWhisper/mywhisper.log"))
         finally:
-            _cleanup(mic_wav)
+            _preserve_last_dictation(mic_wav)
             self._events.put(("done",))
             log.info("dictation: cycle complete")
 
@@ -553,6 +846,22 @@ class MyWhisperApp(rumps.App):
             except Exception:
                 log.exception("meeting: calendar lookup failed")
 
+            # Crash-safety: write the meeting to disk the moment the
+            # transcript exists. If the app dies or is quit during the
+            # LLM summary (it happened), the recording is not lost — the
+            # file is already there with a pending note, and the
+            # dashboard's Redo button can fill in the summary later.
+            cal_title = (cal_event.get("title") if cal_event else "") or ""
+            self._stage("Saving transcript…")
+            path = output.save_meeting(
+                config.app_dir(), transcript_md,
+                "## ⏳ Summary pending\n\nIf this note never fills in, the "
+                "app was closed mid-processing — open the Dashboard and "
+                "click Redo on this meeting to generate the summary.",
+                title=cal_title,
+                live_notes=getattr(self, "_meeting_notes", ""))
+            log.info("meeting: transcript saved early -> %s", path)
+
             title = ""
             try:
                 log.info("meeting: summarizing via LLM (provider=%s, model=%s)",
@@ -562,6 +871,10 @@ class MyWhisperApp(rumps.App):
                 def _on_stage(stage_text, chars):
                     self.meeting_panel.set_processing(stage_text, chars)
 
+                # The calendar event is passed as CONTEXT (real attendee
+                # names beat "Speaker 1") but the title comes from what
+                # was actually said — calendar titles proved unreliable
+                # (generic, or a nearby event that wasn't this meeting).
                 title, summary_md = summarize.summarize_transcript(
                     self.cfg, text,
                     preset_id=getattr(self, "_meeting_preset", None),
@@ -569,8 +882,6 @@ class MyWhisperApp(rumps.App):
                     live_notes=getattr(self, "_meeting_notes", ""),
                     on_stage=_on_stage,
                 )
-                if cal_event and cal_event.get("title"):
-                    title = cal_event["title"]
                 if not summary_md or not summary_md.strip():
                     raise RuntimeError("Empty summary returned by LLM.")
                 if title:
@@ -604,18 +915,29 @@ class MyWhisperApp(rumps.App):
                 )
 
             self._stage("Saving notes…")
-            path = output.save_meeting(config.app_dir(), transcript_md,
-                                       summary_md, title=title)
+            final_title = title or cal_title   # calendar = fallback only
+            stamp = output.parse_meeting(path)["stamp"]
+            output.rewrite_meeting(path, final_title, stamp, summary_md,
+                                   getattr(self, "_meeting_notes", ""),
+                                   transcript_md)
+            if title:
+                # The content title arrived after the early save — put
+                # it in the filename too (replaces any calendar slug).
+                path = output.rename_meeting(path, title)
             log.info("meeting: saved %s", path)
+            self._last_meeting_path = str(path)
             if summary_failed:
                 sounds.play_failed(self.cfg)
                 self._events.put(("notify", "Meeting saved (summary failed)",
-                                  "Check the file for details."))
+                                  "Click to open and see details.",
+                                  {"open_path": str(path)}))
             else:
                 sounds.play_done(self.cfg)
                 self._events.put(("notify",
                                   title or "Meeting notes ready",
-                                  path.name))
+                                  f"Click to open {path.name}",
+                                  {"open_path": str(path)}))
+            self._events.put(("refresh_dashboard",))
         except Exception:
             log.exception("meeting: failed")
             sounds.play_failed(self.cfg)

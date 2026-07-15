@@ -146,6 +146,10 @@ def find_meeting_near(when=None, window_minutes=30):
         predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
             start_ns, end_ns, None)
         events = list(store.eventsMatchingPredicate_(predicate) or [])
+        # All-day items (birthdays, holidays) are not meetings — without
+        # this, a recording on someone's birthday gets titled "X's
+        # Birthday" no matter what the meeting actually was.
+        events = [e for e in events if not e.isAllDay()]
         if not events:
             log.info("calendar lookup: no events in ±%dmin window", window_minutes)
             return None

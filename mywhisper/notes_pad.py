@@ -28,7 +28,7 @@ class NotesPad:
     def _build(self):
         import objc
         from AppKit import (
-            NSColor, NSView, NSScreen, NSBackingStoreBuffered,
+            NSColor, NSView, NSScreen, NSBackingStoreBuffered, NSApplication,
             NSTextView, NSScrollView, NSFont, NSTextField, NSBezierPath,
         )
         from Foundation import NSMakeRect, NSMakeSize
@@ -47,6 +47,27 @@ class NotesPad:
 
             def canBecomeMainWindow(self):
                 return False    # never become "main" — we're a utility
+
+            def performKeyEquivalent_(self, event):
+                # Menu-bar apps have no Edit menu, so Cmd-C/V/X/A/Z
+                # never resolve through the menu system the way they do
+                # in normal apps — dispatch them to the focused view
+                # (the text view) by hand.
+                CMD, SHIFT = 1 << 20, 1 << 17
+                flags = event.modifierFlags()
+                if flags & CMD:
+                    key = (event.charactersIgnoringModifiers() or "").lower()
+                    selector = {
+                        "c": "copy:",
+                        "v": "paste:",
+                        "x": "cut:",
+                        "a": "selectAll:",
+                        "z": "redo:" if flags & SHIFT else "undo:",
+                    }.get(key)
+                    if selector and NSApplication.sharedApplication() \
+                            .sendAction_to_from_(selector, None, self):
+                        return True
+                return objc.super(_NotesPanel, self).performKeyEquivalent_(event)
 
         WIDTH, HEIGHT = 360, 220
         # Borderless + nonactivating: floats above other apps but doesn't
@@ -114,6 +135,7 @@ class NotesPad:
         text_view.setRichText_(False)
         text_view.setEditable_(True)
         text_view.setSelectable_(True)
+        text_view.setAllowsUndo_(True)   # so Cmd-Z works
         text_view.setAutomaticQuoteSubstitutionEnabled_(False)
         text_view.setAutomaticDashSubstitutionEnabled_(False)
         text_view.setAutomaticSpellingCorrectionEnabled_(False)
@@ -140,13 +162,17 @@ class NotesPad:
         self._text_view = text_view
 
     # ------------------------------------------------------------------
-    def show(self):
+    def show(self, initial_text=""):
         if self._disabled:
             return
         try:
             if self._window is None:
                 self._build()
-            self._text_view.setString_("")
+            self._text_view.setString_(initial_text or "")
+            # Park the cursor at the end so typing continues after any
+            # pre-filled header.
+            n = len((initial_text or ""))
+            self._text_view.setSelectedRange_((n, 0))
             # orderFrontRegardless avoids activating MyWhisper.app —
             # the panel just appears above other windows without
             # stealing focus. The user clicks into it to type.

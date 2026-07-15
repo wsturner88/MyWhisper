@@ -8,20 +8,24 @@ import html
 import json
 import logging
 import os
+import re
+import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
 import objc
 from AppKit import (
-    NSPanel, NSScreen, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
-    NSWindowStyleMaskResizable, NSWindowStyleMaskUtilityWindow,
-    NSBackingStoreBuffered, NSFloatingWindowLevel, NSColor,
+    NSWindow, NSScreen, NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
+    NSBackingStoreBuffered, NSColor,
     NSWindowStyleMaskFullSizeContentView, NSApp,
     NSMakeRect, NSMakeSize, NSOpenPanel, NSObject, NSURL,
 )
 from Foundation import NSURL as FNSURL
 
-from . import config, dictation_log, autostart, vocab, recorder, screen_recording
+from . import (config, dictation_log, autostart, output, vocab, recorder,
+               screen_recording)
 
 log = logging.getLogger("mywhisper")
 
@@ -36,7 +40,7 @@ WKUserContentController = objc.lookUpClass("WKUserContentController")
 _panel = None
 _webview = None
 _bridge = None  # NSObject delegate; keep a reference or PyObjC will GC it
-_PANEL_W = 620
+_PANEL_W = 1080
 _PANEL_H = 720
 
 # Callbacks invoked when the user's custom preset list changes — the app
@@ -66,13 +70,39 @@ def _meeting_files():
         return []
     files = sorted(out_dir.glob("meeting_*.md"), reverse=True)
     meetings = []
+    this_year = datetime.now().year
     for f in files[:50]:
         try:
             raw = f.read_text()
-            name = f.stem.replace("meeting_", "").replace("_", " @ ")
-            meetings.append({"name": name, "filename": f.name, "content": raw})
+            parts = output.parse_meeting(f)
         except Exception:
-            pass
+            continue
+        # The heading inside the file is the real title; the filename slug
+        # is the fallback. A friendly date/time renders underneath.
+        title = (parts.get("title") or "").strip()
+        when = ""
+        m = re.match(r"meeting_(\d{4}-\d{2}-\d{2})_(\d{4})(?:_(.+))?$", f.stem)
+        if m:
+            date_s, time_s, slug = m.group(1), m.group(2), m.group(3) or ""
+            if not title:
+                title = slug.replace("_", " ").strip() or "Meeting (no title)"
+            try:
+                dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H%M")
+                day = dt.strftime("%a %b %-d")
+                if dt.year != this_year:
+                    day += f", {dt.year}"
+                when = day + dt.strftime(" · %-I:%M %p")
+            except ValueError:
+                when = date_s
+        meetings.append({
+            "title": title or f.stem,
+            "when": when,
+            "filename": f.name,
+            "summary_md": parts.get("summary_md", ""),
+            "notes_md": parts.get("notes_md", ""),
+            "transcript_md": parts.get("transcript_md", ""),
+            "content": raw,
+        })
     return meetings
 
 
@@ -145,12 +175,52 @@ def _save_vocab_text(text):
 
 # -- Bridge: messages from JavaScript --------------------------------------
 
+def _pyify(obj):
+    """Recursively convert Cocoa collection types (NSDictionary/NSArray,
+    passed up from the WKWebView) into native Python dict/list/str so the
+    rest of the module can use isinstance and .get() safely."""
+    if isinstance(obj, (str, bool, int, float)) or obj is None:
+        return obj
+    # NSDictionary / NSArray expose the mapping / sequence protocols but
+    # are NOT dict / list subclasses.
+    if hasattr(obj, "allKeys") or isinstance(obj, dict):
+        return {str(k): _pyify(obj[k]) for k in obj.keys()}
+    if hasattr(obj, "count") and not isinstance(obj, (str, bytes)):
+        try:
+            return [_pyify(x) for x in obj]
+        except TypeError:
+            pass
+    return str(obj)
+
+
 class _BridgeHandler(NSObject):
     """Receives postMessage() calls from the dashboard HTML."""
 
+    def callJS_(self, js):
+        """Runs on the main thread (via performSelectorOnMainThread) —
+        WebKit requires evaluateJavaScript to be called there."""
+        try:
+            if _webview is not None:
+                _webview.evaluateJavaScript_completionHandler_(str(js), None)
+        except Exception:
+            log.exception("dashboard: callJS failed")
+
+    def refreshPanel_(self, _arg):
+        """Main-thread trampoline for refresh_if_open() — used by worker
+        threads that just saved a new meeting file."""
+        refresh_if_open()
+
     def userContentController_didReceiveScriptMessage_(self, controller, message):
         try:
-            body = dict(message.body())
+            # Deep-convert the whole message from Cocoa types to native
+            # Python. dict(message.body()) only converts the TOP level —
+            # a nested object (e.g. {filename, preset}) stays an
+            # NSDictionary, which fails isinstance(x, dict) and gets
+            # stringified into garbage. That surfaced as a bogus 'File
+            # not found' on the redo-with-preset and edit actions.
+            body = _pyify(message.body())
+            if not isinstance(body, dict):
+                return
             action = body.get("action")
             log.info("dashboard bridge: %s", action)
             handler = _ACTIONS.get(action)
@@ -193,27 +263,38 @@ def _act_set_custom_url(body):
 
 
 def _act_test_llm(body):
-    from . import llm
-    ok, msg = llm.test_connection()
-    _call_js("onTestResult", {"ok": bool(ok), "message": str(msg)})
+    # Network call with a long timeout — run it off the main thread so a
+    # slow provider can't freeze the menu bar and push-to-talk.
+    def _work():
+        from . import llm
+        try:
+            ok, msg = llm.test_connection()
+        except Exception as e:
+            ok, msg = False, str(e)
+        _call_js("onTestResult", {"ok": bool(ok), "message": str(msg)})
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _act_fetch_models(body):
-    from . import llm
-    try:
-        models = llm.list_models()
-        _call_js("onModelsLoaded", {
-            "ok": True,
-            "models": models,
-            "provider": config.get_llm_provider(),
-        })
-    except Exception as e:
-        log.exception("dashboard: fetch_models failed")
-        _call_js("onModelsLoaded", {
-            "ok": False,
-            "error": str(e),
-            "provider": config.get_llm_provider(),
-        })
+    def _work():
+        from . import llm
+        try:
+            models = llm.list_models()
+            _call_js("onModelsLoaded", {
+                "ok": True,
+                "models": models,
+                "provider": config.get_llm_provider(),
+            })
+        except Exception as e:
+            log.exception("dashboard: fetch_models failed")
+            _call_js("onModelsLoaded", {
+                "ok": False,
+                "error": str(e),
+                "provider": config.get_llm_provider(),
+            })
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _act_set_mic(body):
@@ -303,6 +384,283 @@ def _act_open_screen_recording_settings(body):
     screen_recording.open_settings()
 
 
+def _act_import_transcript(body):
+    """Summarize pasted text (Voice Memos transcript, Teams notes, …)
+    through the normal meeting pipeline and save it as a meeting file."""
+    val = body.get("value") or {}
+    text = str(val.get("text") or "").strip()
+    title_in = str(val.get("title") or "").strip()
+    preset = str(val.get("preset") or "").strip() or None
+    if not text:
+        _call_js("onImportDone", {"ok": False, "error": "No text pasted."})
+        return
+
+    def _work():
+        import time
+        from . import output, summarize
+        try:
+            _call_js("onImportStage", {"stage": "Summarizing with AI…"})
+            title, summary_md = summarize.summarize_transcript(
+                config.load(), text, preset_id=preset,
+                on_stage=lambda stage, chars=0: _call_js(
+                    "onImportStage", {"stage": str(stage)}))
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("The LLM returned an empty summary.")
+            summary_md = ("> 📥 Imported transcript — summarized from "
+                          "pasted text, not recorded by MyWhisper.\n\n"
+                          + summary_md)
+            path = output.save_meeting(config.app_dir(), text, summary_md,
+                                       title=title_in or title)
+            log.info("dashboard: imported transcript -> %s", path)
+            _call_js("onImportDone", {"ok": True, "filename": path.name})
+            time.sleep(1.2)   # let the ✓ register before the page reloads
+            _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "refreshPanel:", None, False)
+        except Exception as e:
+            log.exception("dashboard: import transcript failed")
+            _call_js("onImportDone", {"ok": False, "error": str(e)})
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _resolve_meeting(raw):
+    """Turn a filename from the JS side into a real meeting Path, or None.
+
+    macOS stores filenames decomposed (NFD: 'e' + combining acute) while
+    the browser/JSON round-trip usually hands them back composed (NFC:
+    'é'). An exact `app_dir / name` then fails path.exists() even though
+    the file is right there — which showed up as a bogus 'File not found'
+    when re-summarizing meetings whose title had a curly apostrophe or an
+    accent. Try the exact name, both normalizations, then a basename
+    match against what's actually on disk."""
+    import unicodedata
+    name = os.path.basename(str(raw or ""))
+    if not (name.startswith("meeting_") and name.endswith(".md")):
+        log.warning("dashboard: bad meeting name from UI: %r", name)
+        return None
+    app_dir = config.app_dir()
+    candidates = [name,
+                  unicodedata.normalize("NFC", name),
+                  unicodedata.normalize("NFD", name)]
+    for cand in candidates:
+        p = app_dir / cand
+        if p.exists():
+            return p
+    # Last resort: compare normalized basenames against the directory.
+    target = unicodedata.normalize("NFC", name)
+    on_disk = []
+    try:
+        for p in app_dir.glob("meeting_*.md"):
+            on_disk.append(p.name)
+            if unicodedata.normalize("NFC", p.name) == target:
+                return p
+    except OSError:
+        pass
+    log.warning("dashboard: could not resolve meeting file %r in %s "
+                "(%d files on disk; closest: %s)",
+                name, app_dir, len(on_disk),
+                ", ".join(n for n in on_disk if n[:25] == name[:25])[:200]
+                or "none share the prefix")
+    return None
+
+
+def _meeting_payload(path):
+    """Freshly parsed parts + raw content, in the shape app.js expects."""
+    parts = output.parse_meeting(path)
+    return {
+        "title": parts.get("title", ""),
+        "summary_md": parts.get("summary_md", ""),
+        "notes_md": parts.get("notes_md", ""),
+        "transcript_md": parts.get("transcript_md", ""),
+        "content": Path(path).read_text(),
+    }
+
+
+def _act_save_meeting_part(body):
+    """Inline edit from the reader — replace the summary or the typed
+    notes of a saved meeting, leaving everything else untouched."""
+    val = body.get("value") or {}
+    part = val.get("part")
+    text = str(val.get("text") or "").strip()
+    path = _resolve_meeting(val.get("filename"))
+    name = path.name if path else os.path.basename(str(val.get("filename") or ""))
+    if path is None or part not in ("summary", "notes"):
+        _call_js("onSavePartDone",
+                 {"ok": False, "filename": name, "error": "Bad request."})
+        return
+    try:
+        parts = output.parse_meeting(path)
+        output.rewrite_meeting(
+            path, parts["title"], parts["stamp"],
+            text if part == "summary" else parts["summary_md"],
+            text if part == "notes" else parts["notes_md"],
+            parts["transcript_md"])
+        log.info("dashboard: edited %s of %s", part, name)
+        _call_js("onSavePartDone",
+                 {"ok": True, "filename": name,
+                  "meeting": _meeting_payload(path)})
+    except Exception as e:
+        log.exception("dashboard: save meeting part failed")
+        _call_js("onSavePartDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
+def _act_resummarize_meeting(body):
+    """Re-run the AI summary for an existing meeting from its saved
+    transcript — no re-recording. Useful after switching to a better
+    model, when a summary came out weak, or with a different meeting
+    type ('preset' in the payload)."""
+    val = body.get("value")
+    preset = None
+    if isinstance(val, dict):
+        raw = val.get("filename") or ""
+        preset = str(val.get("preset") or "").strip() or None
+    else:
+        raw = val
+    path = _resolve_meeting(raw)
+    name = path.name if path else os.path.basename(str(raw or ""))
+    if path is None:
+        _call_js("onResummarizeDone",
+                 {"ok": False, "filename": name, "error": "File not found."})
+        return
+
+    def _work():
+        from . import output, summarize
+        try:
+            parts = output.parse_meeting(path)
+            transcript = parts["transcript_md"].strip()
+            if not transcript or transcript == "_(no speech detected)_":
+                raise RuntimeError("This meeting has no transcript to "
+                                   "summarize.")
+            llm_input = output.transcript_to_attributed(transcript)
+
+            _call_js("onResummarizeStage",
+                     {"filename": name, "stage": "Re-summarizing…"})
+            _new_title, summary_md = summarize.summarize_transcript(
+                config.load(), llm_input,
+                preset_id=preset,
+                live_notes=parts["notes_md"],
+                on_stage=lambda stage, chars=0: _call_js(
+                    "onResummarizeStage",
+                    {"filename": name, "stage": str(stage)}))
+            if not summary_md or not summary_md.strip():
+                raise RuntimeError("The LLM returned an empty summary.")
+
+            # Preserve any leading banner (e.g. 'mic-only' or 'imported')
+            # from the previous summary so that context isn't lost.
+            banner_lines = []
+            for line in parts["summary_md"].split("\n"):
+                if line.startswith(">"):
+                    banner_lines.append(line)
+                else:
+                    break
+            banner = "\n".join(banner_lines).strip()
+            if banner:
+                summary_md = f"{banner}\n\n{summary_md}"
+
+            output.rewrite_meeting(
+                path, parts["title"], parts["stamp"], summary_md,
+                parts["notes_md"], transcript)
+            log.info("dashboard: re-summarized %s", name)
+            fresh = output.parse_meeting(path)
+            _call_js("onResummarizeDone",
+                     {"ok": True, "filename": name,
+                      "meeting": {
+                          "title": fresh.get("title", ""),
+                          "summary_md": fresh.get("summary_md", ""),
+                          "notes_md": fresh.get("notes_md", ""),
+                          "transcript_md": fresh.get("transcript_md", ""),
+                          "content": path.read_text(),
+                      }})
+        except Exception as e:
+            log.exception("dashboard: resummarize failed")
+            _call_js("onResummarizeDone",
+                     {"ok": False, "filename": name, "error": str(e)})
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _act_record_meeting(body):
+    """Sidebar Record button — poke the app's trigger-file channel so the
+    normal meeting flow (preset, indicator, notes pad) takes over."""
+    try:
+        (config.app_dir() / "meeting_trigger").touch()
+    except Exception:
+        log.exception("dashboard: record trigger failed")
+
+
+def _act_rename_meeting(body):
+    """Change a meeting's title — updates the heading inside the file and
+    renames the file so its slug matches. The AI titles from transcript
+    content and sometimes leads with the wrong company; this is the
+    user's override."""
+    val = body.get("value") or {}
+    new_title = str(val.get("title") or "").strip()
+    path = _resolve_meeting(val.get("filename"))
+    name = path.name if path else os.path.basename(
+        str(val.get("filename") or ""))
+    if path is None or not new_title:
+        _call_js("onRenameDone",
+                 {"ok": False, "filename": name, "error": "Bad request."})
+        return
+    try:
+        parts = output.parse_meeting(path)
+        output.rewrite_meeting(path, new_title, parts["stamp"],
+                               parts["summary_md"], parts["notes_md"],
+                               parts["transcript_md"])
+        path = output.rename_meeting(path, new_title)
+        log.info("dashboard: renamed %s -> %r (%s)", name, new_title,
+                 path.name)
+        _call_js("onRenameDone",
+                 {"ok": True, "filename": name,
+                  "new_filename": path.name,
+                  "meeting": _meeting_payload(path)})
+    except Exception as e:
+        log.exception("dashboard: rename failed")
+        _call_js("onRenameDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
+def _act_delete_meeting(body):
+    """Move a meeting file to the macOS Trash — recoverable, never rm."""
+    raw = body.get("value")
+    path = _resolve_meeting(raw)
+    name = path.name if path else os.path.basename(str(raw or ""))
+    if path is None:
+        _call_js("onDeleteDone",
+                 {"ok": False, "filename": name, "error": "File not found."})
+        return
+    try:
+        from Foundation import NSFileManager
+        ok, _moved_to, err = (
+            NSFileManager.defaultManager()
+            .trashItemAtURL_resultingItemURL_error_(
+                NSURL.fileURLWithPath_(str(path)), None, None))
+        if not ok:
+            raise RuntimeError(str(err) if err else "Trash refused the file.")
+        log.info("dashboard: moved %s to Trash", name)
+        # This action runs inline on the main thread (not a worker), so a
+        # direct evaluateJavaScript here would re-enter the JS engine mid
+        # postMessage and WebKit can drop it — the row wouldn't disappear.
+        # Rebuild the list authoritatively from disk on the next runloop
+        # tick instead; the trashed file is already gone, so it's correct.
+        if _bridge is not None:
+            _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "refreshPanel:", None, False)
+    except Exception as e:
+        log.exception("dashboard: delete failed")
+        _call_js("onDeleteDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
+def _act_open_meeting(body):
+    """Open a meeting .md file in the default editor. Only real meeting
+    files inside the data folder are accepted."""
+    path = _resolve_meeting(body.get("value"))
+    if path is not None:
+        subprocess.run(["open", str(path)], check=False)
+
+
 def _act_close_panel(body):
     try:
         if _panel is not None:
@@ -351,6 +709,13 @@ _ACTIONS = {
     "update_custom_preset": _act_update_custom_preset,
     "delete_custom_preset": _act_delete_custom_preset,
     "pick_folder": _act_pick_folder,
+    "open_meeting": _act_open_meeting,
+    "record_meeting": _act_record_meeting,
+    "resummarize_meeting": _act_resummarize_meeting,
+    "save_meeting_part": _act_save_meeting_part,
+    "rename_meeting": _act_rename_meeting,
+    "delete_meeting": _act_delete_meeting,
+    "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,
     "fetch_models": _act_fetch_models,
     "set_custom_url": _act_set_custom_url,
@@ -360,10 +725,15 @@ _ACTIONS = {
 
 
 def _call_js(fn_name, payload):
-    if _webview is None:
+    if _webview is None or _bridge is None:
         return
     js = f"window.{fn_name} && window.{fn_name}({json.dumps(payload)});"
-    _webview.evaluateJavaScript_completionHandler_(js, None)
+    from Foundation import NSThread
+    if NSThread.isMainThread():
+        _webview.evaluateJavaScript_completionHandler_(js, None)
+    else:
+        _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "callJS:", js, False)
 
 
 def _push_state():
@@ -371,510 +741,78 @@ def _push_state():
 
 
 # -- HTML / CSS / JS for the dashboard --------------------------------------
+# The UI lives in real files (dashboard_ui/style.css, app.js); this module
+# only assembles the skeleton and injects the boot data.
 
-def _build_html():
-    meetings = _meeting_files()
-    dictations = dictation_log.recent()
-    state = _state_snapshot()
+_UI_DIR = Path(__file__).resolve().parent / "dashboard_ui"
 
-    meetings_html = ""
-    if not meetings:
-        meetings_html = '<p class="empty">No meetings recorded yet.</p>'
-    else:
-        for i, m in enumerate(meetings):
-            safe_content = html.escape(m["content"])
-            meetings_html += f"""
-            <div class="card">
-                <div class="card-header" onclick="toggleMeeting({i})">
-                    <span class="card-title">{html.escape(m['name'])}</span>
-                    <span class="card-file">{html.escape(m['filename'])}</span>
-                    <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
-                    <span class="chevron" id="chev-{i}">&#9654;</span>
-                </div>
-                <div class="card-body" id="meeting-{i}">
-                    <div class="card-body-toolbar">
-                        <button class="copy-btn" onclick="copyMeeting({i}, event)">Copy</button>
-                        <button class="close-btn-inline" onclick="toggleMeeting({i}); event.stopPropagation();">&times; Close</button>
-                    </div>
-                    <pre class="card-body-content">{safe_content}</pre>
-                </div>
-            </div>"""
 
-    dictations_html = ""
-    if not dictations:
-        dictations_html = '<p class="empty">No dictations yet. Use push-to-talk and they\'ll appear here.</p>'
-    else:
-        for i, d in enumerate(dictations):
-            safe_text = html.escape(d["text"])
-            dictations_html += f"""
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">{html.escape(d['timestamp'])}</span>
-                    <button class="copy-btn" onclick="copyText({i}, event)">Copy</button>
-                </div>
-                <div class="dict-text" id="dict-{i}">{safe_text}</div>
-            </div>"""
+def _ui_asset(name):
+    return (_UI_DIR / name).read_text()
 
-    now = datetime.now().strftime("%I:%M %p")
-    state_json = json.dumps(state)
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>MyWhisper</title>
-<style>
-    :root {{
-        --bg: #1a1a2e;
-        --surface: #222244;
-        --surface2: #2a2a4a;
-        --surface3: #303050;
-        --accent: #e94560;
-        --accent2: #0f3460;
-        --text: #eee;
-        --text2: #aaa;
-        --text3: #777;
-        --green: #4ecca3;
-        --red: #e94560;
-        --radius: 10px;
-    }}
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-        background: var(--bg);
-        color: var(--text);
-        -webkit-user-select: none;
-        user-select: none;
-    }}
-    .header {{
-        background: linear-gradient(135deg, var(--accent2), #16213e);
-        padding: 18px 20px 12px;
-        border-bottom: 2px solid var(--accent);
-        -webkit-app-region: drag;
-        position: relative;
-    }}
-    .close-btn {{
-        position: absolute;
-        top: 12px;
-        right: 14px;
-        width: 26px;
-        height: 26px;
-        border: none;
-        background: rgba(255, 255, 255, 0.10);
-        color: var(--text);
-        font-size: 13px;
-        font-weight: 600;
-        line-height: 1;
-        border-radius: 13px;
-        cursor: pointer;
-        -webkit-app-region: no-drag;
-        transition: all 0.15s;
-    }}
-    .close-btn:hover {{
-        background: var(--accent);
-        color: white;
-    }}
-    .header h1 {{ font-size: 18px; font-weight: 600; }}
-    .header h1 span {{ color: var(--accent); }}
-    .header .updated {{
-        font-size: 11px;
-        color: var(--text2);
-        margin-top: 3px;
-    }}
-    .tabs {{
-        display: flex;
-        background: var(--surface);
-        border-bottom: 1px solid #333;
-    }}
-    .tab {{
-        flex: 1;
-        padding: 12px 0;
-        text-align: center;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 500;
-        color: var(--text2);
-        transition: all 0.2s;
-        border-bottom: 3px solid transparent;
-    }}
-    .tab:hover {{ color: var(--text); background: var(--surface2); }}
-    .tab.active {{
-        color: var(--accent);
-        border-bottom-color: var(--accent);
-    }}
-    .tab-count {{
-        display: inline-block;
-        background: var(--accent2);
-        color: var(--text2);
-        font-size: 10px;
-        padding: 1px 6px;
-        border-radius: 8px;
-        margin-left: 5px;
-    }}
-    .tab.active .tab-count {{
-        background: var(--accent);
-        color: white;
-    }}
-    .scroll-area {{
-        overflow-y: auto;
-        max-height: calc(100vh - 110px);
-        padding: 14px 16px 24px;
-    }}
-    .content {{ display: none; }}
-    .content.active {{ display: block; }}
-    .card {{
-        background: var(--surface);
-        border-radius: var(--radius);
-        margin-bottom: 10px;
-        overflow: hidden;
-        border: 1px solid #333;
-    }}
-    .card:hover {{ border-color: #555; }}
-    .card-header {{
-        display: flex;
-        align-items: center;
-        padding: 12px 14px;
-        cursor: pointer;
-        gap: 10px;
-    }}
-    .card-title {{ font-weight: 500; font-size: 13px; flex-shrink: 0; }}
-    .card-file {{
-        color: var(--text2);
-        font-size: 11px;
-        flex: 1;
-        text-align: right;
-    }}
-    .chevron {{
-        color: var(--text2);
-        font-size: 11px;
-        transition: transform 0.2s;
-    }}
-    .chevron.open {{ transform: rotate(90deg); }}
-    .card-body {{
-        display: none;
-        max-height: 380px;
-        overflow-y: auto;
-        position: relative;
-    }}
-    .card-body.open {{ display: block; }}
-    .card-body-toolbar {{
-        position: sticky;
-        top: 0;
-        z-index: 2;
-        display: flex;
-        gap: 6px;
-        justify-content: flex-end;
-        padding: 8px 14px;
-        background: linear-gradient(to bottom,
-            var(--surface) 0%,
-            var(--surface) 85%,
-            rgba(34, 34, 68, 0) 100%);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }}
-    .card-body-content {{
-        padding: 4px 14px 14px;
-        margin: 0;
-        font-size: 12px;
-        line-height: 1.6;
-        color: var(--text2);
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        font-family: inherit;
-        -webkit-user-select: text;
-        user-select: text;
-    }}
-    .close-btn-inline {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px solid #555;
-        padding: 5px 11px;
-        border-radius: 6px;
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s;
-    }}
-    .close-btn-inline:hover {{
-        background: var(--surface2);
-        color: var(--text);
-        border-color: #777;
-    }}
-    .dict-text {{
-        padding: 0 14px 12px;
-        font-size: 13px;
-        line-height: 1.5;
-        -webkit-user-select: text;
-        user-select: text;
-    }}
-    .copy-btn, .btn {{
-        background: var(--accent2);
-        color: var(--text);
-        border: 1px solid #444;
-        padding: 6px 14px;
-        border-radius: 6px;
-        font-size: 12px;
-        cursor: pointer;
-        transition: all 0.15s;
-        flex-shrink: 0;
-    }}
-    .btn:hover, .copy-btn:hover {{
-        background: var(--accent);
-        border-color: var(--accent);
-    }}
-    .copy-btn.copied {{
-        background: var(--green);
-        border-color: var(--green);
-        color: #111;
-    }}
-    .empty {{
-        text-align: center;
-        color: var(--text2);
-        padding: 50px 16px;
-        font-size: 14px;
-    }}
+_BODY = """
+<aside class="side">
+  <div class="side-top">
+    <div class="search">&#128269; <input id="side-search" type="text"
+         placeholder="Search everything&#8230;"></div>
+  </div>
+  <button class="record-btn" onclick="recordMeeting()">
+    <span class="dot"></span> <span id="record-btn-label">Record a meeting</span>
+  </button>
 
-    /* ----- Settings ----- */
-    .settings-section {{
-        background: var(--surface);
-        border-radius: var(--radius);
-        padding: 16px 18px;
-        margin-bottom: 14px;
-        border: 1px solid #333;
-    }}
-    .settings-section h3 {{
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--accent);
-        margin-bottom: 4px;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-    }}
-    .settings-section .section-desc {{
-        font-size: 11px;
-        color: var(--text3);
-        margin-bottom: 14px;
-    }}
-    .field {{ margin-bottom: 14px; }}
-    .field:last-child {{ margin-bottom: 0; }}
-    .field-label {{
-        display: block;
-        font-size: 12px;
-        color: var(--text2);
-        margin-bottom: 6px;
-        font-weight: 500;
-    }}
-    .field-hint {{
-        font-size: 10px;
-        color: var(--text3);
-        margin-top: 4px;
-    }}
-    .field-row {{
-        display: flex;
-        gap: 8px;
-        align-items: center;
-    }}
-    input[type=text], input[type=password], select, textarea {{
-        background: var(--bg);
-        color: var(--text);
-        border: 1px solid #444;
-        padding: 7px 10px;
-        border-radius: 6px;
-        font-size: 12px;
-        font-family: inherit;
-        width: 100%;
-        outline: none;
-    }}
-    input[type=text]:focus, input[type=password]:focus,
-    select:focus, textarea:focus {{
-        border-color: var(--accent);
-    }}
-    select {{
-        cursor: pointer;
-        appearance: none;
-        -webkit-appearance: none;
-        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><polygon points='0,0 10,0 5,6' fill='%23aaa'/></svg>");
-        background-repeat: no-repeat;
-        background-position: right 10px center;
-        background-size: 10px 6px;
-        padding-right: 28px;
-    }}
-    textarea {{
-        min-height: 110px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 11px;
-        line-height: 1.5;
-        resize: vertical;
-    }}
-    .folder-display {{
-        background: var(--bg);
-        border: 1px solid #444;
-        padding: 7px 10px;
-        border-radius: 6px;
-        font-size: 11px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        color: var(--text2);
-        flex: 1;
-        overflow-x: auto;
-        white-space: nowrap;
-    }}
-    .toggle {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        cursor: pointer;
-    }}
-    .toggle input {{ accent-color: var(--accent); }}
-    .toggle-label {{ font-size: 12px; color: var(--text); }}
-    .pill-status {{
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 10px;
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.4px;
-        margin-left: 6px;
-    }}
-    .pill-status.ok {{ background: var(--green); color: #111; }}
-    .pill-status.missing {{ background: var(--red); color: white; }}
-    #test-result {{
-        font-size: 11px;
-        margin-top: 8px;
-        min-height: 16px;
-    }}
-    #test-result.ok {{ color: var(--green); }}
-    #test-result.err {{ color: var(--red); }}
-    .preset-group-label {{
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-        color: var(--text3);
-        margin-bottom: 4px;
-        font-weight: 600;
-    }}
-    .preset-row {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        background: var(--bg);
-        border: 1px solid #444;
-        border-radius: 6px;
-        padding: 8px 10px;
-        margin-bottom: 4px;
-        transition: all 0.15s;
-    }}
-    .preset-row:hover {{ border-color: #666; }}
-    .preset-row.selected {{
-        border-color: var(--accent);
-        background: var(--surface2);
-    }}
-    .preset-row .preset-pick {{
-        flex: 1;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }}
-    .preset-row .preset-radio {{
-        width: 14px;
-        height: 14px;
-        border-radius: 7px;
-        border: 1.5px solid #666;
-        flex-shrink: 0;
-        background: transparent;
-    }}
-    .preset-row.selected .preset-radio {{
-        background: var(--accent);
-        border-color: var(--accent);
-        box-shadow: inset 0 0 0 2px var(--bg);
-    }}
-    .preset-row .preset-label {{
-        font-size: 12px;
-        font-weight: 500;
-    }}
-    .preset-row .preset-actions {{
-        display: flex;
-        gap: 4px;
-    }}
-    .preset-row .icon-btn {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px solid transparent;
-        padding: 3px 7px;
-        border-radius: 4px;
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s;
-    }}
-    .preset-row .icon-btn:hover {{
-        background: var(--surface2);
-        color: var(--text);
-        border-color: #555;
-    }}
-    .preset-row .icon-btn.delete:hover {{
-        color: var(--red);
-        border-color: var(--red);
-    }}
-    .btn-ghost {{
-        background: transparent;
-        border: 1px solid #444;
-    }}
-    .btn-ghost:hover {{
-        background: var(--surface2);
-        border-color: #555;
-    }}
-    .starter-btn {{
-        background: transparent;
-        color: var(--text2);
-        border: 1px dashed #555;
-        padding: 4px 10px;
-        border-radius: 12px;
-        font-size: 11px;
-        cursor: pointer;
-        margin: 0 2px;
-        transition: all 0.15s;
-    }}
-    .starter-btn:hover {{
-        border-color: var(--accent);
-        color: var(--text);
-    }}
-</style>
-</head>
-<body>
+  <div class="nav-item active" data-view="meetings"><span class="ico">&#128203;</span> Meetings</div>
+  <div class="nav-item" data-view="dictation"><span class="ico">&#127908;</span> Dictation</div>
+  <div class="nav-item" data-view="import"><span class="ico">&#128229;</span> Import</div>
+  <div class="nav-item" data-view="settings"><span class="ico">&#9881;&#65039;</span> Settings</div>
 
-<div class="header">
-    <button class="close-btn" onclick="send('close_panel', null)" title="Close">&#10005;</button>
-    <h1>&#127908; <span>MyWhisper</span></h1>
-    <div class="updated">Updated {now}</div>
-</div>
+  <div class="group-label">RECENT</div>
+  <div class="meeting-list" id="side-list"></div>
+  <div class="side-foot">&#127908; MyWhisper &#8212; everything on your Mac</div>
+</aside>
 
-<div class="tabs">
-    <div class="tab active" data-tab="meetings" onclick="switchTab('meetings')">
-        Meetings <span class="tab-count">{len(meetings)}</span>
+<main class="main">
+  <div class="card">
+
+    <div class="view active" id="view-meetings"></div>
+
+    <div class="view" id="view-dictation">
+      <div class="view-h1">Dictation history</div>
+      <div class="view-sub">Your recent dictations &#8212; click Copy to reuse one.</div>
+      <div id="dict-list"></div>
     </div>
-    <div class="tab" data-tab="dictation" onclick="switchTab('dictation')">
-        Dictation <span class="tab-count">{len(dictations)}</span>
+
+    <div class="view" id="view-import">
+      <div class="view-h1">Import a transcript</div>
+      <div class="view-sub">Paste text from your iPhone's Voice Memos, a Teams
+        transcript, or rough notes &#8212; MyWhisper summarizes it and files it
+        with your other meetings.</div>
+      <div class="field">
+        <input type="text" id="import-title"
+               placeholder="Title (optional &#8212; the AI picks one if blank)">
+      </div>
+      <div class="field">
+        <label class="field-label">Meeting type</label>
+        <select id="import-preset"></select>
+      </div>
+      <div class="field">
+        <textarea id="import-text" style="min-height: 180px;"
+                  placeholder="Paste the transcript here&#8230;"></textarea>
+      </div>
+      <div class="field-row">
+        <button class="btn primary" id="import-btn" onclick="runImport()">Summarize &amp; Save</button>
+        <span id="import-status" class="field-hint"></span>
+      </div>
     </div>
-    <div class="tab" data-tab="settings" onclick="switchTab('settings')">
-        Settings
-    </div>
-</div>
 
-<div class="scroll-area">
+    <div class="view" id="view-settings">
+      <div class="view-h1">Settings</div>
+      <div class="view-sub">Presets, AI backend, vocabulary, microphone, and system options.</div>
 
-<div class="content active" id="meetings-content">
-    {meetings_html}
-</div>
-
-<div class="content" id="dictation-content">
-    {dictations_html}
-</div>
-
-<div class="content" id="settings-content">
-
-    <!-- 1. Meeting Type Presets — most frequently changed -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Meeting Type Presets</h3>
-        <div class="section-desc">Pick the default below — you can choose a different one each time from the Start Meeting submenu.</div>
+        <div class="section-desc">Pick the default below &#8212; you can choose a
+          different one each time from the Start Meeting submenu.</div>
 
         <div class="preset-group-label">Built-in</div>
         <div id="builtin-list"></div>
@@ -883,571 +821,177 @@ def _build_html():
         <div id="custom-list"></div>
 
         <div id="add-row" style="margin-top: 8px;">
-            <button class="btn" onclick="startNewPreset()">+ Add Custom Preset</button>
-            <span class="field-hint" style="margin-left: 10px;">Or use a starter:</span>
-            <span id="starter-buttons"></span>
+          <button class="btn" onclick="startNewPreset()">+ Add Custom Preset</button>
+          <span class="field-hint" style="margin-left: 10px;">Or use a starter:</span>
+          <span id="starter-buttons"></span>
         </div>
 
-        <div id="preset-editor" style="display: none; margin-top: 14px; padding: 14px; background: var(--bg); border: 1px solid #444; border-radius: 8px;">
-            <div class="field">
-                <label class="field-label">Preset Name</label>
-                <input type="text" id="editor-label" placeholder="e.g. Board Meeting, Vendor Call">
-            </div>
-            <div class="field">
-                <label class="field-label">What should the AI focus on?</label>
-                <textarea id="editor-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
-                <div class="field-hint">Plain English — describe what matters most. The AI will lean into this when writing the summary.</div>
-            </div>
-            <div class="field-row">
-                <button class="btn" onclick="savePresetEdit()" id="editor-save-btn">Save</button>
-                <button class="btn btn-ghost" onclick="cancelPresetEdit()">Cancel</button>
-                <span id="editor-status" class="field-hint"></span>
-            </div>
+        <div id="preset-editor" style="display: none; margin-top: 14px;
+             padding: 14px; border: 1px solid var(--line); border-radius: 8px;">
+          <div class="field">
+            <label class="field-label">Preset Name</label>
+            <input type="text" id="editor-label" placeholder="e.g. Board Meeting, Vendor Call">
+          </div>
+          <div class="field">
+            <label class="field-label">What should the AI focus on?</label>
+            <textarea id="editor-focus" placeholder="e.g. budget figures, vendor commitments, regulatory mentions, and any deadlines with owners"></textarea>
+            <div class="field-hint">Plain English &#8212; describe what matters most. The AI will lean into this when writing the summary.</div>
+          </div>
+          <div class="field-row">
+            <button class="btn primary" onclick="savePresetEdit()" id="editor-save-btn">Save</button>
+            <button class="btn" onclick="cancelPresetEdit()">Cancel</button>
+            <span id="editor-status" class="field-hint"></span>
+          </div>
         </div>
-    </div>
+      </div>
 
-    <!-- 2. LLM — provider/key/model -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>LLM (for Meeting Summaries)</h3>
-        <div class="section-desc">Which cloud model writes your meeting notes.</div>
+        <div class="section-desc">Which AI writes your meeting notes.</div>
 
         <div class="field">
-            <label class="field-label">Provider</label>
-            <select id="provider-select" onchange="send('set_provider', this.value)"></select>
+          <label class="field-label">Provider</label>
+          <select id="provider-select" onchange="send('set_provider', this.value)"></select>
         </div>
 
         <div class="field" id="custom-url-row" style="display: none;">
-            <label class="field-label">
-                Server URL <span id="url-status" class="pill-status"></span>
-            </label>
-            <div class="field-row">
-                <input type="text" id="custom-url-input" placeholder="e.g. http://llm.local:11434">
-                <button class="btn" onclick="saveCustomUrl()">Save</button>
-            </div>
-            <div class="field-hint">Ollama, LM Studio, llama.cpp server, etc. — MyWhisper auto-detects the API style.</div>
+          <label class="field-label">
+            Server URL <span id="url-status" class="pill-status"></span>
+          </label>
+          <div class="field-row">
+            <input type="text" id="custom-url-input" placeholder="e.g. http://llm.local:11434">
+            <button class="btn" onclick="saveCustomUrl()">Save</button>
+          </div>
+          <div class="field-hint">Ollama, LM Studio, llama.cpp server, etc. &#8212; MyWhisper auto-detects the API style.</div>
         </div>
 
         <div class="field" id="api-key-row">
-            <label class="field-label" id="api-key-label">API Key <span id="key-status" class="pill-status"></span></label>
-            <div class="field-row">
-                <input type="password" id="api-key-input" placeholder="Paste your key…">
-                <button class="btn" onclick="saveApiKey()">Save</button>
-            </div>
-            <div class="field-hint" id="api-key-hint">Stored securely in macOS Keychain — never written to disk in plain text.</div>
+          <label class="field-label" id="api-key-label">API Key <span id="key-status" class="pill-status"></span></label>
+          <div class="field-row">
+            <input type="password" id="api-key-input" placeholder="Paste your key&#8230;">
+            <button class="btn" onclick="saveApiKey()">Save</button>
+          </div>
+          <div class="field-hint" id="api-key-hint">Stored securely in macOS Keychain &#8212; never written to disk in plain text.</div>
         </div>
 
         <div class="field">
-            <label class="field-label">
-                Model
-                <span id="model-status" class="field-hint" style="margin-left: 6px;"></span>
-            </label>
-            <div class="field-row">
-                <select id="model-select" onchange="onModelPicked()" style="flex: 1;">
-                    <option value="">Loading models…</option>
-                </select>
-                <button class="btn btn-ghost" onclick="refreshModels()" title="Reload list from provider">↻</button>
-            </div>
-            <div class="field-hint">List comes straight from the provider. Pick "Other…" to type a model name manually.</div>
+          <label class="field-label">
+            Model
+            <span id="model-status" class="field-hint" style="margin-left: 6px;"></span>
+          </label>
+          <div class="field-row">
+            <select id="model-select" onchange="onModelPicked()" style="flex: 1;">
+              <option value="">Loading models&#8230;</option>
+            </select>
+            <button class="btn" onclick="refreshModels()" title="Reload list from provider">&#8635;</button>
+          </div>
+          <div class="field-hint">List comes straight from the provider. Pick "Other&#8230;" to type a model name manually.</div>
         </div>
 
         <div class="field" id="model-manual-row" style="display: none;">
-            <label class="field-label">Custom Model ID</label>
-            <div class="field-row">
-                <input type="text" id="model-input" placeholder="exact model identifier">
-                <button class="btn" onclick="saveModel()">Save</button>
-            </div>
+          <label class="field-label">Custom Model ID</label>
+          <div class="field-row">
+            <input type="text" id="model-input" placeholder="exact model identifier">
+            <button class="btn" onclick="saveModel()">Save</button>
+          </div>
         </div>
 
         <div class="field">
-            <button class="btn" onclick="testLLM()">Test Connection</button>
-            <div id="test-result"></div>
+          <button class="btn" onclick="testLLM()">Test Connection</button>
+          <div id="test-result"></div>
         </div>
-    </div>
+      </div>
 
-    <!-- 3. Vocabulary — occasionally edited -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Vocabulary</h3>
-        <div class="section-desc">Custom terms — one per line. Whisper uses these as a hint so it gets names and abbreviations right.</div>
-        <textarea id="vocab-text" placeholder="# One term per line — company names, initials, jargon."></textarea>
+        <div class="section-desc">Custom terms &#8212; one per line. Whisper uses
+          these as a hint so it gets names and abbreviations right.</div>
+        <textarea id="vocab-text" placeholder="# One term per line &#8212; company names, initials, jargon."></textarea>
         <div class="field-row" style="margin-top: 8px;">
-            <button class="btn" onclick="saveVocab()">Save Vocabulary</button>
-            <span id="vocab-status" class="field-hint"></span>
+          <button class="btn primary" onclick="saveVocab()">Save Vocabulary</button>
+          <span id="vocab-status" class="field-hint"></span>
         </div>
-    </div>
+      </div>
 
-    <!-- 4. Microphone & Visualization — set once usually -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Microphone &amp; Visualization</h3>
 
         <div class="field">
-            <label class="field-label">Input Device</label>
-            <select id="mic-select" onchange="send('set_mic', this.value)"></select>
+          <label class="field-label">Input Device</label>
+          <select id="mic-select" onchange="send('set_mic', this.value)"></select>
         </div>
 
         <div class="field">
-            <label class="field-label">Live Indicator Style</label>
-            <select id="viz-select" onchange="send('set_visualization', this.value)">
-                <option value="waveform">Waveform</option>
-                <option value="vu_meter">VU Meter (Retro)</option>
-            </select>
+          <label class="field-label">Live Indicator Style</label>
+          <select id="viz-select" onchange="send('set_visualization', this.value)">
+            <option value="waveform">Waveform</option>
+            <option value="vu_meter">VU Meter (Retro)</option>
+          </select>
         </div>
-    </div>
+      </div>
 
-    <!-- 5. System Audio (for Meeting Recording) -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>System Audio (for Meeting Recording)</h3>
-        <div class="section-desc">macOS gates capture of the other side of your Zoom/Teams calls behind Screen Recording permission. Grant it once and meeting recordings include everyone's audio, not just your microphone.</div>
+        <div class="section-desc">macOS gates capture of the other side of your
+          Zoom/Teams calls behind Screen Recording permission. Grant it once and
+          meeting recordings include everyone's audio, not just your microphone.</div>
 
         <div class="field">
-            <label class="field-label">
-                Screen Recording <span id="sr-status" class="pill-status"></span>
-            </label>
-            <div class="field-row">
-                <button class="btn" onclick="send('request_screen_recording', null)">Request / Test</button>
-                <button class="btn btn-ghost" onclick="send('open_screen_recording_settings', null)">Open System Settings</button>
-            </div>
-            <div class="field-hint" id="sr-hint"></div>
+          <label class="field-label">
+            Screen Recording <span id="sr-status" class="pill-status"></span>
+          </label>
+          <div class="field-row">
+            <button class="btn" onclick="send('request_screen_recording', null)">Request / Test</button>
+            <button class="btn" onclick="send('open_screen_recording_settings', null)">Open System Settings</button>
+          </div>
+          <div class="field-hint" id="sr-hint"></div>
         </div>
-    </div>
+      </div>
 
-    <!-- 6. System — set once -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>System</h3>
         <label class="toggle">
-            <input type="checkbox" id="autostart-toggle" onchange="send('set_autostart', this.checked)">
-            <span class="toggle-label">Start MyWhisper automatically at login</span>
+          <input type="checkbox" id="autostart-toggle" onchange="send('set_autostart', this.checked)">
+          <span class="toggle-label">Start MyWhisper automatically at login</span>
         </label>
-    </div>
+      </div>
 
-    <!-- 6. Data Folder — advanced, rarely changed -->
-    <div class="settings-section">
+      <div class="settings-section">
         <h3>Data Folder</h3>
-        <div class="section-desc">Where recordings, transcripts, and your config are stored. Set once.</div>
+        <div class="section-desc">Where recordings, transcripts, and your config
+          are stored. Set once.</div>
         <div class="field-row">
-            <div class="folder-display" id="folder-display"></div>
-            <button class="btn" onclick="pickFolder()">Change…</button>
+          <div class="folder-display" id="folder-display"></div>
+          <button class="btn" onclick="pickFolder()">Change&#8230;</button>
         </div>
         <div class="field-hint">Changing the folder copies your existing files to the new spot.</div>
+      </div>
+
     </div>
 
-</div>
+  </div>
+</main>
+"""
 
-</div>
 
-<script>
-const initialState = {state_json};
-
-function $(id) {{ return document.getElementById(id); }}
-
-function send(action, value) {{
-    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.bridge) {{
-        window.webkit.messageHandlers.bridge.postMessage({{ action: action, value: value }});
-    }}
-}}
-
-function switchTab(name) {{
-    document.querySelectorAll('.tab').forEach(t => {{
-        t.classList.toggle('active', t.dataset.tab === name);
-    }});
-    document.querySelectorAll('.content').forEach(c => {{
-        c.classList.toggle('active', c.id === name + '-content');
-    }});
-}}
-
-function toggleMeeting(i) {{
-    $('meeting-' + i).classList.toggle('open');
-    $('chev-' + i).classList.toggle('open');
-}}
-
-function copyText(i, event) {{
-    event.stopPropagation();
-    const text = $('dict-' + i).innerText;
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    const btn = event.target;
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 1500);
-}}
-
-function copyMeeting(i, event) {{
-    event.stopPropagation();   // don't toggle the card open/closed
-    const text = $('meeting-' + i).innerText;
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    const btn = event.target;
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('copied'); }}, 1500);
-}}
-
-function saveApiKey() {{
-    const v = $('api-key-input').value.trim();
-    if (v && !v.includes('•')) send('set_api_key', v);
-    $('api-key-input').value = '';
-}}
-
-function saveCustomUrl() {{
-    send('set_custom_url', $('custom-url-input').value.trim());
-}}
-
-function saveModel() {{
-    send('set_model', $('model-input').value.trim());
-}}
-
-function saveVocab() {{
-    send('save_vocab', $('vocab-text').value);
-    const s = $('vocab-status');
-    s.textContent = 'Saved.';
-    setTimeout(() => s.textContent = '', 2000);
-}}
-
-function pickFolder() {{ send('pick_folder', null); }}
-
-function testLLM() {{
-    const r = $('test-result');
-    r.className = '';
-    r.textContent = 'Testing…';
-    send('test_llm', null);
-}}
-
-window.onTestResult = function(payload) {{
-    const r = $('test-result');
-    if (payload.ok) {{
-        r.className = 'ok';
-        r.textContent = '✓ Connected to ' + payload.message;
-    }} else {{
-        r.className = 'err';
-        r.textContent = '✗ ' + payload.message;
-    }}
-}};
-
-window.onState = function(state) {{ renderState(state); }};
-
-function renderState(s) {{
-    $('folder-display').textContent = s.data_dir;
-
-    // Provider dropdown
-    const psel = $('provider-select');
-    psel.innerHTML = '';
-    s.llm_providers.forEach(p => {{
-        const o = document.createElement('option');
-        o.value = p.id;
-        o.textContent = p.label;
-        if (p.id === s.llm_provider) o.selected = true;
-        psel.appendChild(o);
-    }});
-
-    // Provider-specific rows: URL shows only for providers that use one;
-    // the key row shows whenever the provider has a key_name (required
-    // OR optional).
-    $('api-key-row').style.display = s.llm_needs_key ? 'block' : 'none';
-    $('custom-url-row').style.display = s.llm_needs_url ? 'block' : 'none';
-
-    // URL status
-    if (s.llm_needs_url) {{
-        $('custom-url-input').value = s.custom_llm_url || '';
-        const urlPill = $('url-status');
-        if (s.custom_llm_url) {{
-            urlPill.className = 'pill-status ok';
-            urlPill.textContent = 'Set';
-        }} else {{
-            urlPill.className = 'pill-status missing';
-            urlPill.textContent = 'Not set';
-        }}
-    }}
-
-    // API key field label & status pill
-    const keyLabel = $('api-key-label');
-    const pill = $('key-status');
-    const keyHint = $('api-key-hint');
-    if (s.llm_key_optional) {{
-        keyLabel.firstChild.textContent = 'Auth Token (optional) ';
-        keyHint.textContent = 'Most local LLM servers do not need this. Set only if your server requires Bearer authentication.';
-        if (s.api_key_set) {{
-            pill.className = 'pill-status ok';
-            pill.textContent = 'Set';
-            $('api-key-input').placeholder = s.api_key_masked || 'Saved';
-        }} else {{
-            pill.className = '';
-            pill.textContent = '';
-            $('api-key-input').placeholder = 'No auth needed for most servers';
-        }}
-    }} else {{
-        keyLabel.firstChild.textContent = 'API Key ';
-        keyHint.textContent = 'Stored securely in macOS Keychain — never written to disk in plain text.';
-        if (s.api_key_set) {{
-            pill.className = 'pill-status ok';
-            pill.textContent = 'Set';
-            $('api-key-input').placeholder = s.api_key_masked || 'Saved — paste a new key to replace';
-        }} else {{
-            pill.className = 'pill-status missing';
-            pill.textContent = 'Not set';
-            $('api-key-input').placeholder = 'Paste your key…';
-        }}
-    }}
-
-    // Model dropdown is populated asynchronously by refreshModels();
-    // keep the manual text field in sync with the current saved model.
-    $('model-input').value = s.llm_model || '';
-    syncModelDropdown(s.llm_model || '');
-
-    // Mic dropdown
-    const msel = $('mic-select');
-    msel.innerHTML = '';
-    const def = document.createElement('option');
-    def.value = '';
-    def.textContent = 'System Default';
-    if (!s.mic) def.selected = true;
-    msel.appendChild(def);
-    s.mic_devices.forEach(name => {{
-        const o = document.createElement('option');
-        o.value = name;
-        o.textContent = name;
-        if (name === s.mic) o.selected = true;
-        msel.appendChild(o);
-    }});
-
-    $('viz-select').value = s.visualization;
-    $('autostart-toggle').checked = s.autostart;
-
-    // Screen Recording permission status
-    const srPill = $('sr-status');
-    const srHint = $('sr-hint');
-    if (s.screen_recording_granted) {{
-        srPill.className = 'pill-status ok';
-        srPill.textContent = 'Granted';
-        srHint.textContent = 'Both sides of your calls will be captured. ✓';
-    }} else {{
-        srPill.className = 'pill-status missing';
-        srPill.textContent = 'Not granted';
-        srHint.textContent = 'Click Request/Test to trigger the macOS prompt. If you previously denied, that prompt won\\'t show again — use Open System Settings to flip it on manually (under Screen Recording → python3.12).';
-    }}
-    $('vocab-text').value = s.vocabulary;
-
-    // Built-in presets — picker only (no edit/delete)
-    const bi = $('builtin-list');
-    bi.innerHTML = '';
-    s.builtin_presets.forEach(p => renderPresetRow(bi, p, s.meeting_preset, false));
-
-    // Custom presets — picker + edit + delete
-    const cu = $('custom-list');
-    cu.innerHTML = '';
-    if (!s.custom_presets || s.custom_presets.length === 0) {{
-        const empty = document.createElement('div');
-        empty.className = 'field-hint';
-        empty.style.padding = '8px 0';
-        empty.textContent = 'No custom presets yet. Add one below.';
-        cu.appendChild(empty);
-    }} else {{
-        s.custom_presets.forEach(p => renderPresetRow(cu, p, s.meeting_preset, true));
-    }}
-
-    // Starter quick-add buttons
-    const sb = $('starter-buttons');
-    sb.innerHTML = '';
-    (s.starter_presets || []).forEach(starter => {{
-        const btn = document.createElement('button');
-        btn.className = 'starter-btn';
-        btn.textContent = '+ ' + starter.label;
-        btn.onclick = () => send('add_custom_preset', {{
-            label: starter.label, focus: starter.focus
-        }});
-        sb.appendChild(btn);
-    }});
-}}
-
-function renderPresetRow(container, preset, selectedId, editable) {{
-    const row = document.createElement('div');
-    row.className = 'preset-row' + (preset.id === selectedId ? ' selected' : '');
-
-    const pick = document.createElement('div');
-    pick.className = 'preset-pick';
-    pick.innerHTML = '<div class="preset-radio"></div>' +
-                     '<div class="preset-label">' + escapeHtml(preset.label) + '</div>';
-    pick.onclick = () => send('set_preset', preset.id);
-    row.appendChild(pick);
-
-    if (editable) {{
-        const actions = document.createElement('div');
-        actions.className = 'preset-actions';
-        const editBtn = document.createElement('button');
-        editBtn.className = 'icon-btn';
-        editBtn.textContent = 'Edit';
-        editBtn.onclick = (e) => {{ e.stopPropagation(); openEditPreset(preset); }};
-        const delBtn = document.createElement('button');
-        delBtn.className = 'icon-btn delete';
-        delBtn.textContent = 'Delete';
-        delBtn.onclick = (e) => {{
-            e.stopPropagation();
-            if (confirm('Delete preset "' + preset.label + '"?')) {{
-                send('delete_custom_preset', {{ id: preset.id }});
-            }}
-        }};
-        actions.appendChild(editBtn);
-        actions.appendChild(delBtn);
-        row.appendChild(actions);
-    }}
-    container.appendChild(row);
-}}
-
-function escapeHtml(s) {{
-    return String(s || '').replace(/[&<>\"']/g, c => ({{
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }}[c]));
-}}
-
-let _editingId = null;
-
-function startNewPreset() {{
-    _editingId = null;
-    $('editor-label').value = '';
-    $('editor-focus').value = '';
-    $('editor-save-btn').textContent = 'Add Preset';
-    $('preset-editor').style.display = 'block';
-    $('editor-label').focus();
-}}
-
-function openEditPreset(preset) {{
-    _editingId = preset.id;
-    $('editor-label').value = preset.label;
-    $('editor-focus').value = preset.focus;
-    $('editor-save-btn').textContent = 'Save Changes';
-    $('preset-editor').style.display = 'block';
-    $('editor-label').focus();
-}}
-
-function cancelPresetEdit() {{
-    _editingId = null;
-    $('preset-editor').style.display = 'none';
-}}
-
-function savePresetEdit() {{
-    const label = $('editor-label').value;
-    const focus = $('editor-focus').value;
-    if (_editingId) {{
-        send('update_custom_preset', {{ id: _editingId, label: label, focus: focus }});
-    }} else {{
-        send('add_custom_preset', {{ label: label, focus: focus }});
-    }}
-    _editingId = null;
-    $('preset-editor').style.display = 'none';
-}}
-
-// --- Model dropdown -----------------------------------------------------
-
-let _modelList = [];      // last-fetched list of id/label objects
-let _lastProvider = '';   // refetch when this changes
-
-function syncModelDropdown(currentId) {{
-    const sel = $('model-select');
-    sel.innerHTML = '';
-    if (_modelList.length === 0) {{
-        const opt = document.createElement('option');
-        opt.value = currentId || '';
-        opt.textContent = currentId ? currentId + ' (saved)' : 'Loading models…';
-        sel.appendChild(opt);
-    }} else {{
-        let matched = false;
-        _modelList.forEach(m => {{
-            const opt = document.createElement('option');
-            opt.value = m.id;
-            opt.textContent = m.label;
-            if (m.id === currentId) {{ opt.selected = true; matched = true; }}
-            sel.appendChild(opt);
-        }});
-        // If the saved model isn't in the fetched list, show it as a
-        // disabled item at the top so the user can see what's saved.
-        if (currentId && !matched) {{
-            const opt = document.createElement('option');
-            opt.value = currentId;
-            opt.textContent = currentId + ' (saved, not in current list)';
-            opt.selected = true;
-            sel.insertBefore(opt, sel.firstChild);
-        }}
-        const other = document.createElement('option');
-        other.value = '__other__';
-        other.textContent = 'Other… (type a model name)';
-        sel.appendChild(other);
-    }}
-    // Show manual row if Other is selected
-    $('model-manual-row').style.display =
-        (sel.value === '__other__') ? 'block' : 'none';
-}}
-
-function refreshModels() {{
-    $('model-status').textContent = 'Loading…';
-    send('fetch_models', null);
-}}
-
-window.onModelsLoaded = function(payload) {{
-    if (payload.ok) {{
-        _modelList = payload.models || [];
-        $('model-status').textContent = _modelList.length + ' available';
-        const currentModel = $('model-input').value;
-        // If nothing is saved yet, or the saved one isn't in this server's
-        // list, auto-pick the first model so Test Connection just works.
-        const matched = _modelList.some(m => m.id === currentModel);
-        if (_modelList.length > 0 && (!currentModel || !matched)) {{
-            const auto = _modelList[0].id;
-            $('model-input').value = auto;
-            send('set_model', auto);
-            syncModelDropdown(auto);
-        }} else {{
-            syncModelDropdown(currentModel);
-        }}
-    }} else {{
-        _modelList = [];
-        $('model-status').textContent = '⚠ ' + (payload.error || 'load failed');
-        syncModelDropdown($('model-input').value);
-    }}
-}};
-
-function onModelPicked() {{
-    const sel = $('model-select');
-    const v = sel.value;
-    if (v === '__other__') {{
-        $('model-manual-row').style.display = 'block';
-        $('model-input').focus();
-        return;
-    }}
-    $('model-manual-row').style.display = 'none';
-    if (v) {{
-        $('model-input').value = v;
-        send('set_model', v);
-    }}
-}}
-
-renderState(initialState);
-
-// Fetch models in the background on first open. Also refetch whenever
-// the provider dropdown changes (provider is in the state pushed back
-// after set_provider).
-refreshModels();
-
-(function() {{
-    _lastProvider = initialState.llm_provider;
-    const origOnState = window.onState;
-    window.onState = function(state) {{
-        if (state.llm_provider !== _lastProvider) {{
-            _lastProvider = state.llm_provider;
-            _modelList = [];   // clear stale list before refetching
-            refreshModels();
-        }}
-        origOnState(state);
-    }};
-}})();
-</script>
-</body>
-</html>"""
+def _build_html():
+    meetings = _meeting_files()
+    dictations = dictation_log.recent()
+    state = _state_snapshot()
+    # "</" must be escaped or a literal "</script>" inside a transcript
+    # would terminate the script block.
+    boot = json.dumps({
+        "state": state,
+        "meetings": meetings,
+        "dictations": dictations,
+    }).replace("</", "<\\/")
+    return (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        "<title>MyWhisper</title>\n<style>\n" + _ui_asset("style.css")
+        + "\n</style>\n</head>\n<body>\n" + _BODY
+        + "\n<script>\nwindow.BOOT = " + boot + ";\n"
+        + _ui_asset("app.js") + "\n</script>\n</body>\n</html>"
+    )
 
 
 # -- Panel creation ----------------------------------------------------------
@@ -1456,35 +1000,34 @@ def _create_panel():
     global _panel, _webview, _bridge
 
     screen = NSScreen.mainScreen().frame()
-    x = screen.size.width - _PANEL_W - 12
-    y = screen.size.height - _PANEL_H - 36
+    x = (screen.size.width - _PANEL_W) / 2.0
+    y = (screen.size.height - _PANEL_H) / 2.0
 
+    # A real app window: traffic lights, minimize, normal stacking (no
+    # always-on-top), remembered size/position. The title bar stays
+    # transparent and the content extends underneath it, so the traffic
+    # lights float over the sidebar.
     style = (
         NSWindowStyleMaskTitled
+        | NSWindowStyleMaskClosable
+        | NSWindowStyleMaskMiniaturizable
         | NSWindowStyleMaskResizable
-        | NSWindowStyleMaskUtilityWindow
         | NSWindowStyleMaskFullSizeContentView
     )
     rect = NSMakeRect(x, y, _PANEL_W, _PANEL_H)
-    _panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+    _panel = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         rect, style, NSBackingStoreBuffered, False,
     )
     _panel.setTitle_("MyWhisper")
     _panel.setTitleVisibility_(1)  # NSWindowTitleVisibilityHidden
     _panel.setTitlebarAppearsTransparent_(True)
-    _panel.setLevel_(NSFloatingWindowLevel)
-    _panel.setBecomesKeyOnlyIfNeeded_(False)
-    _panel.setHidesOnDeactivate_(False)
-    _panel.setBackgroundColor_(NSColor.colorWithRed_green_blue_alpha_(
-        0.102, 0.102, 0.18, 1.0
-    ))
-    _panel.setMinSize_(NSMakeSize(480, 480))
-
-    # Hide the traffic-light buttons; we draw our own close button in HTML.
-    for btn_index in (0, 1, 2):   # close, miniaturize, zoom
-        btn = _panel.standardWindowButton_(btn_index)
-        if btn is not None:
-            btn.setHidden_(True)
+    # Closing hides the window (the app lives in the menu bar); without
+    # this the window object would be deallocated on close.
+    _panel.setReleasedWhenClosed_(False)
+    _panel.setBackgroundColor_(NSColor.windowBackgroundColor())
+    _panel.setMinSize_(NSMakeSize(840, 560))
+    # Remember size/position across opens and app restarts.
+    _panel.setFrameAutosaveName_("MyWhisperDashboard")
 
     # Configure WKWebView with a script message handler so JS can call us.
     wk_config = WKWebViewConfiguration.alloc().init()
@@ -1506,17 +1049,24 @@ def _load_content():
     _webview.loadHTMLString_baseURL_(html_str, None)
 
 
-def open_dashboard():
-    """Toggle the dashboard panel — show it (refreshed) or hide it."""
-    global _panel, _webview
+def refresh_if_open():
+    """Reload the dashboard content if the panel is currently showing —
+    called after a meeting finishes so the new file appears right away."""
     try:
         if _panel is not None and _panel.isVisible():
-            _panel.orderOut_(None)
-            return
+            _load_content()
+            log.info("dashboard: refreshed after meeting")
+    except Exception:
+        log.exception("dashboard: refresh failed")
 
+
+def reveal():
+    """Always show the dashboard, bringing it to front (never toggles).
+    Used by the Dock-icon click, where hiding would be surprising."""
+    global _panel, _webview
+    try:
         if _panel is None:
             _create_panel()
-
         _load_content()
         _panel.makeKeyAndOrderFront_(None)
         try:
@@ -1524,6 +1074,15 @@ def open_dashboard():
             NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         except Exception:
             pass
-        log.info("dashboard: opened")
+        log.info("dashboard: revealed")
     except Exception:
-        log.exception("dashboard: failed to open")
+        log.exception("dashboard: failed to reveal")
+
+
+def open_dashboard():
+    """Toggle the dashboard panel — show it (refreshed) or hide it."""
+    global _panel
+    if _panel is not None and _panel.isVisible():
+        _panel.orderOut_(None)
+        return
+    reveal()
