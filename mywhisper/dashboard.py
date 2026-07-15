@@ -607,7 +607,14 @@ def _act_delete_meeting(body):
         if not ok:
             raise RuntimeError(str(err) if err else "Trash refused the file.")
         log.info("dashboard: moved %s to Trash", name)
-        _call_js("onDeleteDone", {"ok": True, "filename": name})
+        # This action runs inline on the main thread (not a worker), so a
+        # direct evaluateJavaScript here would re-enter the JS engine mid
+        # postMessage and WebKit can drop it — the row wouldn't disappear.
+        # Rebuild the list authoritatively from disk on the next runloop
+        # tick instead; the trashed file is already gone, so it's correct.
+        if _bridge is not None:
+            _bridge.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "refreshPanel:", None, False)
     except Exception as e:
         log.exception("dashboard: delete failed")
         _call_js("onDeleteDone",
