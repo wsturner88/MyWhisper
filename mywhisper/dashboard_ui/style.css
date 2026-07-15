@@ -251,6 +251,15 @@ body {
   font-weight: 650;
   letter-spacing: -.01em;
   margin: 2px 0 14px;
+  border-radius: 6px;
+  cursor: text;
+}
+.reader-title:hover { background: var(--hover); box-shadow: 0 0 0 6px var(--hover); }
+.title-input {
+  font-size: 21px;
+  font-weight: 650;
+  letter-spacing: -.01em;
+  padding: 6px 10px;
 }
 
 .btn {

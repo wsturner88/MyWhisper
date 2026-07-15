@@ -589,6 +589,38 @@ def _act_record_meeting(body):
         log.exception("dashboard: record trigger failed")
 
 
+def _act_rename_meeting(body):
+    """Change a meeting's title — updates the heading inside the file and
+    renames the file so its slug matches. The AI titles from transcript
+    content and sometimes leads with the wrong company; this is the
+    user's override."""
+    val = body.get("value") or {}
+    new_title = str(val.get("title") or "").strip()
+    path = _resolve_meeting(val.get("filename"))
+    name = path.name if path else os.path.basename(
+        str(val.get("filename") or ""))
+    if path is None or not new_title:
+        _call_js("onRenameDone",
+                 {"ok": False, "filename": name, "error": "Bad request."})
+        return
+    try:
+        parts = output.parse_meeting(path)
+        output.rewrite_meeting(path, new_title, parts["stamp"],
+                               parts["summary_md"], parts["notes_md"],
+                               parts["transcript_md"])
+        path = output.rename_meeting(path, new_title)
+        log.info("dashboard: renamed %s -> %r (%s)", name, new_title,
+                 path.name)
+        _call_js("onRenameDone",
+                 {"ok": True, "filename": name,
+                  "new_filename": path.name,
+                  "meeting": _meeting_payload(path)})
+    except Exception as e:
+        log.exception("dashboard: rename failed")
+        _call_js("onRenameDone",
+                 {"ok": False, "filename": name, "error": str(e)})
+
+
 def _act_delete_meeting(body):
     """Move a meeting file to the macOS Trash — recoverable, never rm."""
     raw = body.get("value")
@@ -681,6 +713,7 @@ _ACTIONS = {
     "record_meeting": _act_record_meeting,
     "resummarize_meeting": _act_resummarize_meeting,
     "save_meeting_part": _act_save_meeting_part,
+    "rename_meeting": _act_rename_meeting,
     "delete_meeting": _act_delete_meeting,
     "import_transcript": _act_import_transcript,
     "close_panel": _act_close_panel,

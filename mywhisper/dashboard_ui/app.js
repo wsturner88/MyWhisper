@@ -100,6 +100,7 @@ function selectMeeting(i) {
   selectedMeeting = i;
   readerTab = "notes";
   editingPart = null;
+  editingTitle = false;
   redoOpen = false;
   switchView("meetings");
   renderSidebarList();
@@ -168,6 +169,7 @@ function renderSidebarList() {
 // ---- meeting reader ----
 
 let editingPart = null;   // null | "notes" | "mynotes"
+let editingTitle = false;
 let redoOpen = false;
 
 function renderReader() {
@@ -236,7 +238,14 @@ function renderReader() {
       '<button class="btn" id="btn-open">Open file</button>' +
       '<button class="btn danger" id="btn-delete">Delete</button>' +
     "</div>" +
-    '<h1 class="reader-title">' + escapeHtml(m.title) + "</h1>" +
+    (editingTitle
+      ? '<div class="field-row" style="margin: 2px 0 14px;">' +
+          '<input type="text" id="title-input" class="title-input">' +
+          '<button class="btn primary" id="btn-title-save">Save</button>' +
+          '<button class="btn" id="btn-title-cancel">Cancel</button>' +
+        "</div>"
+      : '<h1 class="reader-title" id="reader-title" title="Click to rename">' +
+          escapeHtml(m.title) + "</h1>") +
     '<div class="seg" id="reader-tabs">' +
       tabs.map(([id, label]) =>
         '<button data-tab="' + id + '"' + (id === readerTab ? ' class="on"' : "") + ">" +
@@ -264,8 +273,38 @@ function renderReader() {
     }
   };
   el.querySelectorAll("#reader-tabs button").forEach(b => {
-    b.onclick = () => { readerTab = b.dataset.tab; editingPart = null; renderReader(); };
+    b.onclick = () => {
+      readerTab = b.dataset.tab;
+      editingPart = null;
+      editingTitle = false;
+      renderReader();
+    };
   });
+
+  if (editingTitle) {
+    const inp = $("title-input");
+    inp.value = m.title;
+    inp.focus();
+    inp.select();
+    const saveTitle = () => {
+      const t = inp.value.trim();
+      if (!t || t === m.title) { editingTitle = false; renderReader(); return; }
+      $("btn-title-save").disabled = true;
+      send("rename_meeting", { filename: m.filename, title: t });
+    };
+    $("btn-title-save").onclick = saveTitle;
+    $("btn-title-cancel").onclick = () => { editingTitle = false; renderReader(); };
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") saveTitle();
+      if (e.key === "Escape") { editingTitle = false; renderReader(); }
+    });
+  } else {
+    $("reader-title").onclick = () => {
+      editingTitle = true;
+      redoOpen = false;
+      renderReader();
+    };
+  }
 
   if (editable && !isEditing) {
     $("btn-edit").onclick = () => { editingPart = readerTab; redoOpen = false; renderReader(); };
@@ -336,6 +375,24 @@ window.onDeleteDone = function (p) {
     s.className = "status-line ok";
     s.textContent = "✓ Moved to Trash (recoverable from the macOS Trash)";
     setTimeout(() => { if (s.textContent.includes("Trash")) s.textContent = ""; }, 5000);
+  }
+};
+
+window.onRenameDone = function (p) {
+  const idx = MEETINGS.findIndex(m => m.filename === p.filename);
+  if (p.ok && idx !== -1) {
+    Object.assign(MEETINGS[idx], p.meeting || {});
+    MEETINGS[idx].filename = p.new_filename || p.filename;
+    editingTitle = false;
+    if (idx === selectedMeeting) renderReader();
+    renderSidebarList();
+    const s = $("reader-status");
+    if (s) { s.className = "status-line ok"; s.textContent = "✓ Renamed"; setTimeout(renderReader, 2500); }
+  } else {
+    const s = $("reader-status");
+    if (s) { s.className = "status-line err"; s.textContent = "✗ " + (p.error || "Rename failed."); }
+    const b = $("btn-title-save");
+    if (b) b.disabled = false;
   }
 };
 
